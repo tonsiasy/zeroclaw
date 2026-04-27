@@ -8665,7 +8665,6 @@ pub struct WeChatConfig {
     pub enabled: bool,
     /// Account ID returned by `wechat-agent login`. Credentials (bot_token, base_url)
     /// are loaded from `~/.openclaw/openclaw-weixin/accounts/<account_id>.json`.
-    #[serde(default)]
     pub account_id: String,
     /// Allowed WeChat iLink user IDs. Empty = deny all, "*" = allow all.
     #[serde(default)]
