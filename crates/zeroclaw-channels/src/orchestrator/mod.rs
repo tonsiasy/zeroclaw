@@ -58,6 +58,8 @@ pub use crate::voice_wake::VoiceWakeChannel;
 pub use crate::wati::WatiChannel;
 pub use crate::webhook::WebhookChannel;
 pub use crate::wecom::WeComChannel;
+#[cfg(feature = "channel-wechat")]
+pub use crate::wechat::WeChatChannel;
 pub use crate::whatsapp::WhatsAppChannel;
 pub use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 // Local channel types (in misc, not zeroclaw-channels)
@@ -4238,6 +4240,18 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 wc.allowed_users.clone(),
             )))
         }
+        #[cfg(feature = "channel-wechat")]
+        "wechat" => {
+            let wc = config
+                .channels
+                .wechat
+                .as_ref()
+                .context("WeChat channel is not configured")?;
+            Ok(Arc::new(WeChatChannel::new(
+                wc.account_id.clone(),
+                wc.allowed_users.clone(),
+            )?))
+        }
         "nextcloud_talk" | "nextcloud-talk" => {
             let nc = config
                 .channels
@@ -4398,7 +4412,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
         }
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
-            matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, nextcloud_talk, wati, linq, \
+            matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wechat, nextcloud_talk, wati, linq, \
             email, gmail_push, irc, twitter, mochat, discord_history, imessage, line, voice-call"
         ),
     }
@@ -4982,6 +4996,21 @@ fn collect_configured_channels(
             });
         } else {
             tracing::info!("WeCom channel configured but disabled (enabled = false)");
+        }
+    }
+
+    #[cfg(feature = "channel-wechat")]
+    if let Some(ref wc) = config.channels.wechat {
+        if wc.enabled {
+            match WeChatChannel::new(wc.account_id.clone(), wc.allowed_users.clone()) {
+                Ok(ch) => channels.push(ConfiguredChannel {
+                    display_name: "WeChat",
+                    channel: Arc::new(ch),
+                }),
+                Err(e) => tracing::error!("WeChat channel init failed: {e}"),
+            }
+        } else {
+            tracing::info!("WeChat channel configured but disabled (enabled = false)");
         }
     }
 
