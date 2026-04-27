@@ -4855,19 +4855,78 @@ pub async fn ws_connect_with_proxy(
 
     match proxy_url {
         None => {
-            // No proxy — delegate directly.
-            let (stream, resp) = tokio_tungstenite::connect_async(ws_url).await?;
-            // Re-wrap the inner stream into our boxed type so the caller
-            // always gets `ProxiedWsStream`.
-            let inner = stream.into_inner();
-            let boxed = BoxedIo(Box::new(inner));
-            let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
-                boxed,
-                tokio_tungstenite::tungstenite::protocol::Role::Client,
-                None,
-            )
-            .await;
-            Ok((ws, resp))
+            // No proxy — establish TCP+TLS manually, wrap in BoxedIo, then
+            // perform the WebSocket handshake over the wrapped stream.
+            //
+            // Previous implementation used `connect_async` followed by
+            // `into_inner()` + `from_raw_socket` to normalize the return
+            // type.  That pattern discards data already buffered by the
+            // tungstenite frame codec, causing channels (Slack Socket Mode,
+            // Discord, etc.) to silently miss the first frames sent by the
+            // server and all subsequent events.
+            use tokio::net::TcpStream;
+
+            let target = reqwest::Url::parse(ws_url)
+                .with_context(|| format!("Invalid WebSocket URL: {ws_url}"))?;
+            let target_host = target
+                .host_str()
+                .ok_or_else(|| anyhow::anyhow!("WebSocket URL has no host: {ws_url}"))?
+                .to_string();
+            let target_port = target
+                .port_or_known_default()
+                .unwrap_or(if target.scheme() == "wss" { 443 } else { 80 });
+
+            let tcp = TcpStream::connect(format!("{target_host}:{target_port}"))
+                .await
+                .with_context(|| format!("TCP connect to {target_host}:{target_port}"))?;
+
+            let is_secure = target.scheme() == "wss";
+            let stream: BoxedIo = if is_secure {
+                let mut root_store = rustls::RootCertStore::empty();
+                root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                let tls_config = std::sync::Arc::new(
+                    rustls::ClientConfig::builder()
+                        .with_root_certificates(root_store)
+                        .with_no_client_auth(),
+                );
+                let connector = tokio_rustls::TlsConnector::from(tls_config);
+                let server_name = rustls_pki_types::ServerName::try_from(target_host.clone())
+                    .with_context(|| format!("Invalid TLS server name: {target_host}"))?;
+                let tls_stream = connector
+                    .connect(server_name, tcp)
+                    .await
+                    .with_context(|| format!("TLS handshake with {target_host}"))?;
+                BoxedIo(Box::new(tls_stream))
+            } else {
+                BoxedIo(Box::new(tcp))
+            };
+
+            let default_port = if is_secure { 443 } else { 80 };
+            let host_header = if target_port == default_port {
+                target_host.clone()
+            } else {
+                format!("{target_host}:{target_port}")
+            };
+
+            let ws_request = tokio_tungstenite::tungstenite::http::Request::builder()
+                .uri(ws_url)
+                .header("Host", host_header)
+                .header("Connection", "Upgrade")
+                .header("Upgrade", "websocket")
+                .header(
+                    "Sec-WebSocket-Key",
+                    tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+                )
+                .header("Sec-WebSocket-Version", "13")
+                .body(())
+                .with_context(|| "Failed to build WebSocket upgrade request")?;
+
+            let (ws_stream, response) =
+                tokio_tungstenite::client_async(ws_request, stream)
+                    .await
+                    .with_context(|| format!("WebSocket handshake failed for {ws_url}"))?;
+
+            Ok((ws_stream, response))
         }
         Some(proxy) => ws_connect_via_proxy(ws_url, &proxy).await,
     }
@@ -7294,6 +7353,14 @@ pub struct MatrixConfig {
     /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
     #[serde(default = "default_channel_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
+    /// When true (default), replies are sent as thread replies. Starts a new thread from the
+    /// incoming message when none exists. When false, only continues existing threads.
+    #[serde(default = "default_true")]
+    pub reply_in_thread: bool,
+    /// When true (default), the bot sends acknowledgement reactions while processing
+    /// (👀 on receipt, ✅ on completion). Disable to keep rooms reaction-free.
+    #[serde(default = "default_true")]
+    pub ack_reactions: bool,
 }
 
 impl ChannelConfig for MatrixConfig {
@@ -11785,8 +11852,12 @@ auto_save = true
 
     #[test]
     async fn memory_config_pgvector_roundtrip() {
+        // `auto_save` is required on MemoryConfig and unrelated to the pgvector
+        // fields these tests exercise. Including it keeps the fixture parseable
+        // without coupling the test to schema-default behavior on auto_save.
         let toml = r#"
             backend = "postgres"
+            auto_save = true
             [postgres]
             vector_enabled = true
             vector_dimensions = 768
@@ -11803,7 +11874,10 @@ auto_save = true
 
     #[test]
     async fn memory_config_pgvector_defaults_when_omitted() {
-        let toml = r#"backend = "postgres""#;
+        let toml = r#"
+            backend = "postgres"
+            auto_save = true
+        "#;
         let parsed: MemoryConfig = toml::from_str(toml).unwrap();
         assert!(!parsed.postgres.vector_enabled);
         assert_eq!(parsed.postgres.vector_dimensions, 1536);
@@ -12916,6 +12990,8 @@ default_temperature = 0.7
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
@@ -12948,6 +13024,8 @@ default_temperature = 0.7
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -12971,6 +13049,17 @@ allowed_rooms = ["!ops:matrix.org"]
         assert!(parsed.user_id.is_none());
         assert!(parsed.device_id.is_none());
         assert_eq!(parsed.allowed_rooms, vec!["!ops:matrix.org"]);
+    }
+
+    #[test]
+    async fn matrix_config_reply_in_thread_defaults_to_true() {
+        let toml = r#"
+homeserver = "https://matrix.org"
+access_token = "tok"
+allowed_users = ["@u:matrix.org"]
+"#;
+        let parsed: MatrixConfig = toml::from_str(toml).unwrap();
+        assert!(parsed.reply_in_thread);
     }
 
     #[test]
@@ -13057,6 +13146,8 @@ allowed_rooms = ["!ops:matrix.org"]
                 mention_only: false,
                 password: None,
                 approval_timeout_secs: 300,
+                reply_in_thread: true,
+                ack_reactions: true,
             }),
             signal: None,
             whatsapp: None,
@@ -17084,6 +17175,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         };
         let fields = mx.secret_fields();
         assert_eq!(fields.len(), 3);
@@ -17114,6 +17207,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         };
         let fields = mx.secret_fields();
         assert!(!fields[0].is_set);
@@ -17137,6 +17232,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         };
         mx.set_secret("channels.matrix.access-token", "new-token".into())
             .unwrap();
@@ -17161,6 +17258,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         };
         assert!(
             mx.set_secret("channels.matrix.nonexistent", "val".into())
@@ -17202,6 +17301,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         });
 
         let fields = config.secret_fields();
@@ -17229,6 +17330,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         });
 
         config
@@ -17256,6 +17359,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             recovery_key: None,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         });
         config
             .set_secret("channels.matrix.access-token", "sk-test".into())
@@ -17297,6 +17402,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         };
 
         // Encrypt
@@ -17330,6 +17437,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         };
 
         mx.encrypt_secrets(&store).unwrap();
@@ -17361,6 +17470,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         };
 
         mx.encrypt_secrets(&store).unwrap();
@@ -17387,6 +17498,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         }
     }
 
