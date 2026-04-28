@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -6,61 +5,14 @@ use serde::Deserialize;
 use tracing::{debug, info, warn};
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
-const DEFAULT_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
+use super::accounts;
+
 const LONG_POLL_TIMEOUT_MS: u64 = 35_000;
 const LONG_POLL_CLIENT_BUFFER_MS: u64 = 10_000;
 const API_TIMEOUT_MS: u64 = 15_000;
 const SESSION_EXPIRED_ERRCODE: i32 = -14;
 const ITEM_TEXT: i32 = 1;
 const ITEM_VOICE: i32 = 3;
-
-// ── Credential loading ────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-struct AccountData {
-    token: Option<String>,
-    base_url: Option<String>,
-}
-
-fn state_dir() -> PathBuf {
-    // Mirrors weixin-agent-rs resolution order:
-    // $OPENCLAW_STATE_DIR → $CLAWDBOT_STATE_DIR → ~/.openclaw
-    if let Some(v) = std::env::var("OPENCLAW_STATE_DIR").ok().filter(|s| !s.is_empty()) {
-        return PathBuf::from(v);
-    }
-    if let Some(v) = std::env::var("CLAWDBOT_STATE_DIR").ok().filter(|s| !s.is_empty()) {
-        return PathBuf::from(v);
-    }
-    directories::BaseDirs::new()
-        .map(|d| d.home_dir().join(".openclaw"))
-        .unwrap_or_else(|| PathBuf::from(".openclaw"))
-}
-
-fn account_path(account_id: &str) -> PathBuf {
-    state_dir()
-        .join("openclaw-weixin")
-        .join("accounts")
-        .join(format!("{account_id}.json"))
-}
-
-fn sync_buf_path(account_id: &str) -> PathBuf {
-    state_dir()
-        .join("openclaw-weixin")
-        .join("sync_buf")
-        .join(account_id)
-}
-
-fn load_sync_buf(account_id: &str) -> String {
-    std::fs::read_to_string(sync_buf_path(account_id)).unwrap_or_default()
-}
-
-fn save_sync_buf(account_id: &str, buf: &str) {
-    let path = sync_buf_path(account_id);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(path, buf);
-}
 
 // ── API types ─────────────────────────────────────────────────────
 
@@ -121,25 +73,7 @@ pub struct WeChatChannel {
 
 impl WeChatChannel {
     pub fn new(account_id: String, allowed_users: Vec<String>) -> anyhow::Result<Self> {
-        let path = account_path(&account_id);
-        let raw = std::fs::read_to_string(&path).map_err(|e| {
-            anyhow::anyhow!(
-                "WeChat credentials not found at {}: {}. Run `wechat-agent login` first.",
-                path.display(),
-                e
-            )
-        })?;
-        let data: AccountData = serde_json::from_str(&raw)
-            .map_err(|e| anyhow::anyhow!("Failed to parse WeChat credentials: {e}"))?;
-        let bot_token = data
-            .token
-            .filter(|t| !t.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("WeChat credentials missing token"))?;
-        let base_url = data
-            .base_url
-            .filter(|u| !u.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
-
+        let (bot_token, base_url) = accounts::resolve_account(&account_id)?;
         Ok(Self {
             bot_token,
             base_url,
@@ -301,7 +235,7 @@ impl Channel for WeChatChannel {
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         info!("WeChat iLink Bot channel starting (account={})", self.account_id);
-        let mut sync_buf = load_sync_buf(&self.account_id);
+        let mut sync_buf = accounts::load_sync_buf(&self.account_id);
         let mut next_timeout = LONG_POLL_TIMEOUT_MS;
 
         loop {
@@ -336,7 +270,7 @@ impl Channel for WeChatChannel {
             }
 
             if let Some(new_buf) = resp.get_updates_buf.filter(|s| !s.is_empty()) {
-                save_sync_buf(&self.account_id, &new_buf);
+                accounts::save_sync_buf(&self.account_id, &new_buf);
                 sync_buf = new_buf;
             }
 
