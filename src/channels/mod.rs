@@ -3,6 +3,7 @@ pub use zeroclaw_channels::orchestrator::*;
 pub mod matrix;
 #[cfg(feature = "channel-telegram")]
 pub mod telegram;
+pub mod wechat;
 pub mod session_backend {
     pub use zeroclaw_infra::session_backend::*;
 }
@@ -71,5 +72,8 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
             channel_id,
             recipient,
         } => send_channel_message(config, &channel_id, &recipient, &message).await,
+        crate::ChannelCommands::Wechat { wechat_command } => {
+            wechat::handle(wechat_command).await
+        }
     }
 }

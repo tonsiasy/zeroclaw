@@ -271,6 +271,35 @@ Examples:
         #[arg(long)]
         recipient: String,
     },
+    /// Manage WeChat (iLink Bot) accounts: login, list, delete
+    #[command(long_about = "\
+Manage WeChat personal-account credentials for the WeChat channel.
+
+Credentials live under ~/.zeroclaw/wechat/accounts/<account_id>.json \
+(or $ZEROCLAW_STATE_DIR/wechat/accounts/...).
+
+Examples:
+  zeroclaw channel wechat login
+  zeroclaw channel wechat list
+  zeroclaw channel wechat delete tony-xxxxxx")]
+    Wechat {
+        #[command(subcommand)]
+        wechat_command: WechatCommands,
+    },
+}
+
+/// WeChat channel account-management subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WechatCommands {
+    /// Login via WeChat QR scan and save credentials to ~/.zeroclaw/wechat/
+    Login,
+    /// List saved WeChat accounts
+    List,
+    /// Delete a saved WeChat account
+    Delete {
+        /// Account ID (e.g. tony-xxxxxx) to delete
+        account_id: String,
+    },
 }
 
 /// Skills management subcommands
