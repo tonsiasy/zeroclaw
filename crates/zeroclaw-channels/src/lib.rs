@@ -1,9 +1,13 @@
 //! Channel implementations and orchestration for messaging platform integrations.
 
+#![cfg_attr(feature = "channel-matrix", recursion_limit = "256")]
+
 pub mod orchestrator;
 pub mod util;
 
 // Always-compiled channels and utilities (no feature gate)
+#[cfg(feature = "channel-acp-server")]
+pub mod acp_channel;
 pub mod cli;
 pub mod link_enricher;
 pub mod transcription;
