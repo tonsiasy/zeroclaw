@@ -17,9 +17,29 @@ pub use types::{
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
-use tracing::warn;
+use std::sync::{Arc, Mutex};
 
 use types::{SopManifest, SopMeta};
+use zeroclaw_config::schema::SopConfig;
+use zeroclaw_memory::traits::Memory;
+
+/// Build a single shared SopEngine + SopAuditLogger pair.
+///
+/// This is the sole construction site for SOP state within a daemon.
+/// Callers receive `Arc<Mutex<SopEngine>>` and `Arc<SopAuditLogger>`
+/// handles — never call `SopEngine::new` or `SopAuditLogger::new`
+/// directly outside this module.
+pub fn build_sop_engine(
+    config: SopConfig,
+    workspace_dir: &Path,
+    audit_memory: Arc<dyn Memory>,
+) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
+    let mut engine = SopEngine::new(config);
+    engine.reload(workspace_dir);
+    let engine = Arc::new(Mutex::new(engine));
+    let audit = Arc::new(SopAuditLogger::new(audit_memory));
+    (engine, audit)
+}
 
 /// Parse an execution mode string into `SopExecutionMode`, falling back to
 /// `Supervised` for unknown values.
@@ -94,7 +114,13 @@ pub fn load_sops_from_directory(
         match load_sop(&path, default_execution_mode) {
             Ok(sop) => sops.push(sop),
             Err(e) => {
-                warn!("Failed to load SOP from {}: {e}", path.display());
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    &format!("Failed to load SOP from {}", path.display().to_string())
+                );
             }
         }
     }

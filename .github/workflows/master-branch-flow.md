@@ -7,7 +7,9 @@ Use with:
 - [`docs/book/src/maintainers/ci-and-actions.md`](../../docs/book/src/maintainers/ci-and-actions.md)
 - [`docs/book/src/maintainers/release-runbook.md`](../../docs/book/src/maintainers/release-runbook.md)
 
-Last updated: **May 2026** (post-v0.7.4 cleanup).
+Last updated: **June 2026** (merge queue disabled on `master`; maintainers
+merge directly. The `merge_group` CI plumbing is retained, so the queue can be
+re-enabled from branch protection with no code change).
 
 ---
 
@@ -16,7 +18,7 @@ Last updated: **May 2026** (post-v0.7.4 cleanup).
 ZeroClaw uses a single default branch: `master`. All contributor PRs target
 `master` directly. There is no `dev` or promotion branch.
 
-Maintainers with merge authority: `theonlyhennygod` and `JordanTheJet`.
+Maintainers with merge authority: `JordanTheJet`, `singlerider`, `Audacity88`, `WareWolf-MoonWall`, `Nillth`, and `tidux`.
 
 ---
 
@@ -24,7 +26,7 @@ Maintainers with merge authority: `theonlyhennygod` and `JordanTheJet`.
 
 | File | Trigger | Purpose |
 |---|---|---|
-| `ci.yml` | `pull_request` → `master` | Lint + test + build on every PR |
+| `ci.yml` | `pull_request` → `master`; `push` → `master`; `merge_group` (dormant) | Lint + test + build on PRs and trusted post-merge cache-warming runs. The `merge_group` trigger stays wired but never fires while the merge queue is disabled. |
 | `release-stable-manual.yml` | `workflow_dispatch`, tag push `v*` | Stable release (manual, version-gated) |
 | `cross-platform-build-manual.yml` | `workflow_dispatch` | Full platform build matrix (manual smoke check) |
 | `pr-path-labeler.yml` | `pull_request` lifecycle | Automatic path-based PR labeling |
@@ -36,12 +38,15 @@ Maintainers with merge authority: `theonlyhennygod` and `JordanTheJet`.
 | Event | What runs |
 |---|---|
 | PR opened or updated against `master` | `ci.yml` (full lint + test + build) |
+| PR added to the merge queue (`merge_group`) | **Inactive** — the merge queue is currently disabled. If re-enabled, `ci.yml` runs the full gate on a temporary `gh-readonly-queue/master/…` branch stacking the base + earlier queue entries + this PR. |
+| Push to `master` | `ci.yml` (post-merge quality signal + trusted Rust cache warming) |
 | Manual dispatch | `cross-platform-build-manual.yml` or `release-stable-manual.yml` |
 | Tag push `vX.Y.Z` | `release-stable-manual.yml` (full release pipeline) |
 
-There is no automatic CI run on push to master and no automatic release on
-merge. Releases are always intentional — either a manual dispatch or a
-deliberate tag push.
+There is no automatic release on merge. `ci.yml` does run after trusted
+`master` pushes so post-merge Quality Gate runs can seed Rust caches for later
+PRs, but releases remain intentional — either a manual dispatch or a deliberate
+tag push.
 
 ---
 
@@ -62,8 +67,15 @@ deliberate tag push.
    - `test` — `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on `ubuntu-latest`.
    - `security` — `cargo deny check`.
    - `CI Required Gate` — composite job; branch protection requires this.
-3. Maintainer reviews and merges once the gate is green and review policy is
-   satisfied.
+3. Maintainer reviews. Once the gate is green and review policy is satisfied,
+   the maintainer merges the PR directly (squash).
+
+> **Merge queue (currently disabled).** `master` previously *required* a merge
+> queue, which serialized landings and re-tested each PR against the latest base
+> on a temporary `gh-readonly-queue/master/…` branch before it could land. It is
+> disabled for now — maintainers merge directly. The `merge_group` trigger in
+> `ci.yml` is retained, so re-enabling is a one-click branch-protection toggle
+> ("Require merge queue" on the `master` rule) with no code change.
 
 ### 2) Stable Release (manual)
 
@@ -118,7 +130,7 @@ flowchart TD
   L --> SEC["security\ncargo deny check"]
   T & BLD & CHK & C32 & BCH & SEC --> G["CI Required Gate"]
   G -->|red| D["PR stays open"]
-  G -->|green| R["Maintainer merges"]
+  G -->|green| R["Maintainer merges (squash) → master"]
 ```
 
 ### Stable release
