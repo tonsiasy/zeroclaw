@@ -55,6 +55,27 @@ Supported frontmatter fields are `name`, `description`, `version`, `author`, and
 
 A skill can also be a structured TOML manifest (`SKILL.toml`). The `[skill]` table requires `name` and `description`; `version` defaults to `0.1.0` when omitted; `author`, `tags`, and `prompts` are optional. Tool entries may use `kind = "shell"`, `kind = "http"`, or `kind = "script"`. Keep tool descriptions narrow and concrete so the model knows when to use them.
 
+### Slash command options and localizations
+
+A skill tagged `slash` is surfaced as a chat-channel slash command (e.g. Discord `/search`). It may declare typed `[[skill.slash_options]]`; a skill that declares none falls back to a single required free-text input. Both the command description and each option description accept an optional `description_localizations` map keyed by locale code. Unknown or unsupported locale codes are dropped with a warning rather than failing registration, so a typo never wedges command registration.
+
+```toml
+[skill]
+name = "search"
+description = "Search the web"
+tags = ["slash"]
+# Localized command descriptions, keyed by locale code.
+description_localizations = { fr = "Rechercher sur le web", ja = "ウェブを検索" }
+
+[[skill.slash_options]]
+name = "query"
+description = "The search query"
+type = "string"
+required = true
+# Localized option descriptions, same form.
+description_localizations = { fr = "La requête de recherche" }
+```
+
 ## Manage installed skills
 
 List installed skills:
@@ -124,6 +145,8 @@ zeroclaw skills test --verbose
 
 `zeroclaw skills test` runs the skill's `TEST.sh` file when one exists. Inspect `TEST.sh` before running tests from a skill source you do not already trust.
 
+For a worked example that turns a built-in tool into a reusable operator workflow, see [using relationship memory from skills](./relationship-memory-skill-template.md).
+
 ## Prompt-triggered capability suggestions
 
 ZeroClaw can optionally suggest an installable skill capability when a submitted prompt clearly names something that exists in cached registry metadata but is not installed. The server-side path runs after submission and before the normal LLM turn. It only returns a suggestion; it does not install the skill, enable it, write memory, or treat the skill body as global instructions.
@@ -149,5 +172,6 @@ The default prompt injection mode is `full`, which includes full skill instructi
 ## See also
 
 - [Tools overview](./overview.md)
+- [Using relationship memory from skills](./relationship-memory-skill-template.md)
 - [Security overview](../security/overview.md)
 - [Tool receipts](../security/tool-receipts.md)

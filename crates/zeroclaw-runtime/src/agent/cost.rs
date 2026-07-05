@@ -38,6 +38,23 @@ pub fn build_model_provider_pricing(config: &Config) -> ModelProviderPricing {
     pricing
 }
 
+pub fn tool_loop_cost_tracking_context_for_agent(
+    config: &Config,
+    agent_alias: &str,
+) -> Option<ToolLoopCostTrackingContext> {
+    CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)
+        .map(|tracker| tool_loop_cost_tracking_context_from_tracker(config, agent_alias, tracker))
+}
+
+pub fn tool_loop_cost_tracking_context_from_tracker(
+    config: &Config,
+    agent_alias: &str,
+    tracker: Arc<CostTracker>,
+) -> ToolLoopCostTrackingContext {
+    ToolLoopCostTrackingContext::new(tracker, Arc::new(build_model_provider_pricing(config)))
+        .with_agent_alias(agent_alias)
+}
+
 pub fn build_type_level_model_provider_pricing(config: &Config) -> ModelProviderPricing {
     let mut pricing: ModelProviderPricing = HashMap::new();
 
@@ -265,9 +282,32 @@ pub fn record_tool_loop_cost_usage(
         .ok()
         .flatten()?;
     let pricing = provider_pricing(&ctx.model_provider_pricing, model_provider_name);
-    let (input_rate, output_rate, cached_rate) = pricing
+    let (mut input_rate, mut output_rate, mut cached_rate) = pricing
         .map(|map| resolve_rates(map, model))
         .unwrap_or((0.0, 0.0, 0.0));
+
+    // Global catalog fallback: when the operator never hand-priced this model
+    // in config, consult the daemon-wide pricing catalog
+    // (`<data_dir>/pricing.json`, fed by the public LiteLLM/OpenRouter feed).
+    // Exact id matching keeps provider-qualified self-hosted ids — absent from
+    // the public catalog — at $0, so only billed cloud models get a non-zero
+    // rate here.
+    let priced_from_catalog = if input_rate == 0.0 && output_rate == 0.0 {
+        if let Some((cat_in, cat_out, cat_cached)) =
+            crate::agent::pricing_catalog::global_pricing_rates(model)
+        {
+            input_rate = cat_in;
+            output_rate = cat_out;
+            if cached_rate == 0.0 {
+                cached_rate = cat_cached;
+            }
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
 
     let cost_usage = CostTokenUsage::new_with_cache(
         model,
@@ -285,7 +325,10 @@ pub fn record_tool_loop_cost_usage(
     // stream doesn't get spammy. Missing pricing means either the
     // model_provider has no pricing map at all, or the map exists but
     // produced zero rates for this model.
-    if ctx.tracker.is_some() && (pricing.is_none() || (input_rate == 0.0 && output_rate == 0.0)) {
+    if ctx.tracker.is_some()
+        && !priced_from_catalog
+        && (pricing.is_none() || (input_rate == 0.0 && output_rate == 0.0))
+    {
         warn_once_missing_pricing(model_provider_name, model);
     }
 
@@ -315,7 +358,7 @@ pub fn record_tool_loop_cost_usage(
         && let Err(error) =
             tracker.record_usage_with_agent(cost_usage.clone(), ctx.agent_alias.as_deref())
     {
-        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": model, "error": format!("{}", error)})), "Failed to record cost tracking usage: ");
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Provider).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": model, "error": format!("{}", error)})), "Failed to record cost tracking usage: ");
     }
 
     Some((cost_usage.total_tokens, cost_usage.cost_usd))
@@ -350,6 +393,7 @@ fn warn_once_missing_pricing(model_provider: &str, model: &str) {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Provider)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                 .with_attrs(
                     ::serde_json::json!({"model_provider": model_provider, "model": model})
@@ -364,9 +408,11 @@ fn warn_once_missing_pricing(model_provider: &str, model: &str) {
     } else {
         ::zeroclaw_log::record!(
             DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({"model_provider": model_provider, "model": model})
-            ),
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Provider)
+                .with_attrs(
+                    ::serde_json::json!({"model_provider": model_provider, "model": model})
+                ),
             "Cost tracking recorded token usage with zero pricing (no pricing entry found)"
         );
     }
@@ -398,7 +444,7 @@ mod tests {
     fn first_sighting_returns_true() {
         let seen = fresh_seen();
         assert!(
-            missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M2.7"),
+            missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M3"),
             "first observation of a (model_provider, model) pair must report first-sighting"
         );
     }
@@ -409,10 +455,10 @@ mod tests {
         assert!(missing_pricing_first_sighting(
             &seen,
             "minimax",
-            "MiniMax-M2.7"
+            "MiniMax-M3"
         ));
         assert!(
-            !missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M2.7"),
+            !missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M3"),
             "second sighting of the same pair must NOT re-fire WARN"
         );
     }
@@ -423,10 +469,10 @@ mod tests {
         assert!(missing_pricing_first_sighting(
             &seen,
             "minimax",
-            "MiniMax-M2.7"
+            "MiniMax-M3"
         ));
         assert!(
-            missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M3.0"),
+            missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M2.7"),
             "different model under same model_provider is a distinct pair"
         );
     }

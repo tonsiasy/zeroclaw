@@ -136,6 +136,11 @@ pub struct DiscordChannel {
     /// Construction-time wiring of `DiscordConfig.slash_commands` — config
     /// is the source of truth; reloads rebuild the channel.
     slash_commands: bool,
+    /// Registration scope for slash commands (`global`/`guild`), wired from
+    /// `DiscordConfig.slash_command_scope`. Under `guild`, commands register to
+    /// each `guild_ids` entry (instant propagation); empty `guild_ids` falls
+    /// back to global at reconcile time.
+    slash_command_scope: zeroclaw_config::schema::SlashCommandScope,
     /// Live interaction credentials, held channel-locally so the bearer
     /// token never enters reply targets, logs, session keys, or memory
     /// rows. Keyed by interaction id; swept on insert; entries expire with
@@ -195,6 +200,7 @@ impl DiscordChannel {
             thread_channels: Arc::new(AsyncMutex::new(HashMap::new())),
             gateway_session: Mutex::new(DiscordGatewaySession::default()),
             slash_commands: false,
+            slash_command_scope: zeroclaw_config::schema::SlashCommandScope::Global,
             pending_interactions: Arc::new(Mutex::new(HashMap::new())),
             pending_components: Arc::new(Mutex::new(pending::PendingComponents::default())),
             slash_command_resolver: None,
@@ -211,6 +217,17 @@ impl DiscordChannel {
     /// Enable Discord slash commands (register + serve over the Gateway).
     pub fn with_slash_commands(mut self, enabled: bool) -> Self {
         self.slash_commands = enabled;
+        self
+    }
+
+    /// Set the slash-command registration scope (`global`/`guild`), wired from
+    /// `DiscordConfig.slash_command_scope`. Only consulted when slash commands
+    /// are enabled.
+    pub fn with_slash_command_scope(
+        mut self,
+        scope: zeroclaw_config::schema::SlashCommandScope,
+    ) -> Self {
+        self.slash_command_scope = scope;
         self
     }
 
@@ -1731,6 +1748,27 @@ async fn discord_thread_parent(
     result
 }
 
+/// Cache-only variant of [`discord_thread_parent`]: returns the cached parent
+/// id for `channel_id` if a prior [`discord_thread_parent`] call already
+/// populated the cache, otherwise `None`. It performs **no** Discord REST call,
+/// so it is safe on the per-keystroke autocomplete (type-4) path where an
+/// authenticated round-trip would violate the side-effect-free requirement.
+///
+/// A miss (`channel_id` never looked up, or looked up and found to be a
+/// non-thread) yields `None`, which keeps channel authorization fail-closed:
+/// the thread can only pass an allowlist via a known, already-cached parent.
+async fn discord_thread_parent_cached(
+    thread_channels: &Arc<AsyncMutex<HashMap<String, Option<String>>>>,
+    channel_id: &str,
+) -> Option<String> {
+    thread_channels
+        .lock()
+        .await
+        .get(channel_id)
+        .cloned()
+        .flatten()
+}
+
 // Discord gateway intent bits (API v10) — the ones zeroclaw consumes or
 // exposes as opt-ins. https://discord.com/developers/docs/events/gateway#gateway-intents
 const INTENT_GUILDS: u64 = 1 << 0;
@@ -2356,6 +2394,8 @@ impl Channel for DiscordChannel {
                                     let bot_token = self.bot_token.clone();
                                     let resolver = self.slash_command_resolver.clone();
                                     let workspace_dir = self.workspace_dir.clone();
+                                    let slash_command_scope = self.slash_command_scope;
+                                    let guild_ids = self.guild_ids.clone();
                                     zeroclaw_spawn::spawn!(async move {
                                         let specs = match resolver {
                                             Some(resolve) => {
@@ -2375,10 +2415,36 @@ impl Channel for DiscordChannel {
                                             None => Vec::new(),
                                         };
                                         let body = slash_command_registration_body(&specs);
+                                        // Resolve the registration target: `guild` with no guild_ids
+                                        // can't register anywhere, so fall back to global.
+                                        let effective_scope = match slash_command_scope {
+                                            zeroclaw_config::schema::SlashCommandScope::Guild
+                                                if guild_ids.is_empty() =>
+                                            {
+                                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "slash_command_scope=guild but guild_ids is empty; falling back to global slash registration");
+                                                SlashScope::Global
+                                            }
+                                            zeroclaw_config::schema::SlashCommandScope::Guild => {
+                                                SlashScope::Guild
+                                            }
+                                            zeroclaw_config::schema::SlashCommandScope::Global => {
+                                                SlashScope::Global
+                                            }
+                                        };
                                         let fingerprint = {
                                             use std::hash::{Hash, Hasher};
                                             let mut h = std::collections::hash_map::DefaultHasher::new();
                                             body.to_string().hash(&mut h);
+                                            // Fold the registration target in: a scope or guild-set
+                                            // change must force a reconcile even when the command
+                                            // bodies are byte-identical, else flipping
+                                            // `slash_command_scope` would be silently skipped.
+                                            match effective_scope {
+                                                SlashScope::Global => 0u8,
+                                                SlashScope::Guild => 1u8,
+                                            }
+                                            .hash(&mut h);
+                                            guild_ids.hash(&mut h);
                                             h.finish()
                                         };
                                         use crate::discord_slash_state::SlashReconcileState;
@@ -2398,7 +2464,7 @@ impl Channel for DiscordChannel {
                                             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"commands": specs.len() + 1})), "discord slash command set unchanged; skipping re-registration");
                                             return;
                                         }
-                                        match reconcile_slash_commands(&client, &bot_token, &app_id, &body, DISCORD_API_BASE).await {
+                                        match reconcile_slash_commands(&client, &bot_token, &app_id, &body, DISCORD_API_BASE, effective_scope, &guild_ids).await {
                                             Ok(ReconcileOutcome::Reconciled) => {
                                                 SlashReconcileState::record_success(workspace_dir.as_deref(), &app_id, fingerprint, now);
                                                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"commands": specs.len() + 1})), "discord slash commands registered");
@@ -2688,7 +2754,8 @@ impl Channel for DiscordChannel {
                                             thread_ts: None,
                                             attachments: Vec::new(),
                                             subject: None,
-                                        };
+
+                                            ..Default::default()};
                                         if tx.send(channel_msg).await.is_err() {
                                             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "orchestrator channel closed; dropping interaction prompt");
                                         }
@@ -2943,7 +3010,8 @@ impl Channel for DiscordChannel {
                                             thread_ts: None,
                                             attachments: Vec::new(),
                                             subject: None,
-                                        };
+
+                                            ..Default::default()};
                                         if tx.send(channel_msg).await.is_err() {
                                             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "orchestrator channel closed; dropping component prompt");
                                         }
@@ -2992,6 +3060,7 @@ impl Channel for DiscordChannel {
                                     let guild_filter = guild_filter.clone();
                                     let channel_filter = channel_filter.clone();
                                     let resolver = self.slash_command_resolver.clone();
+                                    let thread_channels = self.thread_channels.clone();
 
                                     zeroclaw_spawn::spawn!(async move {
                                         // Fail-closed authz, side-effect-free:
@@ -3001,12 +3070,22 @@ impl Channel for DiscordChannel {
                                         // don't make here). On denial OR no
                                         // matches we answer an empty choice set.
                                         //
-                                        // No thread-parent REST lookup: it is an
-                                        // authenticated round-trip per keystroke
-                                        // and would defeat the side-effect-free
-                                        // requirement, so a channel-filtered
-                                        // thread simply yields no completions
-                                        // (fail-closed) rather than probing.
+                                        // Thread-parent resolution is CACHE-ONLY:
+                                        // a parent populated by an earlier normal
+                                        // message in this thread lets a
+                                        // parent-allowlisted thread authorize
+                                        // autocomplete consistently with the
+                                        // message path (#6829). It reads the shared
+                                        // cache only — NO Discord REST call — so the
+                                        // per-keystroke path stays side-effect-free;
+                                        // an uncached thread still yields no
+                                        // completions (fail-closed) rather than
+                                        // probing.
+                                        let thread_parent = discord_thread_parent_cached(
+                                            &thread_channels,
+                                            &interaction_channel,
+                                        )
+                                        .await;
                                         let authorized = interaction_gate(
                                             &peers,
                                             &guild_filter,
@@ -3014,7 +3093,7 @@ impl Channel for DiscordChannel {
                                             &user_id,
                                             interaction_guild.as_deref(),
                                             &interaction_channel,
-                                            None,
+                                            thread_parent.as_deref(),
                                         )
                                         .is_ok();
 
@@ -3381,7 +3460,8 @@ impl Channel for DiscordChannel {
                         thread_ts,
                         attachments: media_attachments,
                         subject: None,
-                    };
+
+                        ..Default::default()};
 
                     if tx.send(channel_msg).await.is_err() {
                         break;
@@ -3667,6 +3747,7 @@ impl Channel for DiscordChannel {
         recipient: &str,
         message_id: &str,
         text: &str,
+        _suppress_voice: bool,
     ) -> anyhow::Result<()> {
         if self.stream_mode == zeroclaw_config::schema::StreamMode::MultiMessage {
             // Flush remaining buffered text.
@@ -3710,7 +3791,24 @@ impl Channel for DiscordChannel {
         // streaming/draft reply renders embeds the same as a normal send.
         let (text_without_embeds, embeds, _embed_failures, _embeds_truncated) =
             prepare_outgoing_embeds(text, self.workspace_dir.as_deref());
-        let (cleaned_content, parsed_attachments) = parse_attachment_markers(&text_without_embeds);
+        // Interactive components next (same ordering as `send()`): the
+        // `[COMPONENTS:{json}]` body also contains `[`/`]`, so strip it before the
+        // attachment scanner runs. A streamed/draft reply must render components
+        // identically to a normal send. `send()` parsed them but `finalize_draft`
+        // did not, so any reply that streamed (stream_mode != Off) leaked the raw
+        // marker as plain text. Each interactive component carrying a `prompt` is
+        // registered in `pending_components` via `build_marker_components`, so a
+        // click dispatches the same as on the non-streaming path. The action rows
+        // ride the first finalized message below, mirroring embeds.
+        let (text_without_components, component_rows) =
+            parse_component_markers(&text_without_embeds);
+        let component_action_rows = if component_rows.is_empty() {
+            Vec::new()
+        } else {
+            self.build_marker_components(&component_rows)
+        };
+        let (cleaned_content, parsed_attachments) =
+            parse_attachment_markers(&text_without_components);
         let (mut local_files, remote_urls, failures) =
             classify_outgoing_attachments(&parsed_attachments, self.workspace_dir.as_deref());
         let body = with_inline_attachment_urls(&cleaned_content, &remote_urls);
@@ -3731,10 +3829,11 @@ impl Channel for DiscordChannel {
             let mut first_message_id: Option<String> = None;
             for (i, chunk) in chunks.iter().enumerate() {
                 let new_id = if i == 0 {
-                    // Embeds + files ride the first message.
+                    // Embeds + components + files ride the first message.
                     let payload = DiscordOutgoing {
                         content: Some(chunk.clone()),
                         embeds: embeds.clone(),
+                        components: component_action_rows.clone(),
                         ..Default::default()
                     };
                     send_discord_message_payload_with_files(
@@ -3768,10 +3867,11 @@ impl Channel for DiscordChannel {
             let mut first_message_id: Option<String> = None;
             for (i, chunk) in chunks.iter().enumerate() {
                 let new_id = if i == 0 {
-                    // Embeds ride the first message.
+                    // Embeds + components ride the first message.
                     let payload = DiscordOutgoing {
                         content: Some(chunk.clone()),
                         embeds: embeds.clone(),
+                        components: component_action_rows.clone(),
                         ..Default::default()
                     };
                     send_discord_message_payload(&client, &self.bot_token, recipient, &payload)
@@ -3791,13 +3891,16 @@ impl Channel for DiscordChannel {
             return Ok(());
         }
 
-        // Path 3: simple case — edit in-place (with any embeds); fall back to
-        // delete + POST on failure. The reaction target is the draft message_id
-        // when the edit lands; when the fallback fires it's the freshly posted
-        // message instead.
+        // Path 3: simple case, edit in-place (with any embeds + components); fall
+        // back to delete + POST on failure. The reaction target is the draft
+        // message_id when the edit lands; when the fallback fires it's the freshly
+        // posted message instead. Editing the draft to carry the action rows is
+        // what makes a streamed reply's components render (Discord accepts
+        // `components` on a message edit just as on a create).
         let payload = DiscordOutgoing {
             content: Some(content.clone()),
             embeds: embeds.clone(),
+            components: component_action_rows.clone(),
             ..Default::default()
         };
         let reaction_target = match edit_discord_message_payload(
@@ -4046,6 +4149,33 @@ mod tests {
         assert_eq!(
             payload.to_rest_json(),
             serde_json::json!({ "content": "Result", "embeds": [{ "title": "Report" }] })
+        );
+    }
+
+    #[test]
+    fn finalize_draft_payload_carries_components() {
+        // finalize_draft must lift `[COMPONENTS:...]` out of the final streamed text
+        // and attach the action rows to the first message, the same transformation
+        // send() does. Before this fix only send() parsed components, so any reply
+        // that streamed (stream_mode != Off) leaked the raw marker as plain text.
+        // Pin the transformation so the streaming path can't regress to
+        // content-only.
+        let raw = "Pick one [COMPONENTS:{\"rows\":[[{\"label\":\"Go\",\"style\":\"primary\",\"prompt\":\"go\"}]]}]";
+        let (content, rows) = parse_component_markers(raw);
+        assert_eq!(content.trim(), "Pick one");
+        assert_eq!(rows.len(), 1, "one action row parsed");
+        let mut reg = pending::PendingComponents::default();
+        let component_action_rows = build_component_rows("n", &rows, &mut reg);
+        assert_eq!(component_action_rows.len(), 1, "row rendered");
+        let payload = DiscordOutgoing {
+            content: Some(content.trim().to_string()),
+            components: component_action_rows,
+            ..Default::default()
+        };
+        let json = payload.to_rest_json();
+        assert!(
+            json.get("components").is_some(),
+            "finalize payload must carry the action rows; got {json}"
         );
     }
 
@@ -4326,6 +4456,8 @@ mod tests {
             cancellation_token: None,
             attachments: Vec::new(),
             in_reply_to: None,
+            force_voice: false,
+            suppress_voice: false,
         };
         let err = ch.send(&msg).await.unwrap_err();
         assert!(err.to_string().contains("unknown or expired"));
@@ -4335,6 +4467,7 @@ mod tests {
         zeroclaw_runtime::skills::Skill {
             name: name.to_string(),
             description: description.to_string(),
+            description_localizations: Default::default(),
             version: "1.0.0".to_string(),
             author: None,
             tags: tags.iter().map(|t| (*t).to_string()).collect(),
@@ -4421,6 +4554,7 @@ mod tests {
             skill_name: "deploy status".to_string(),
             slug: "deploy-status".to_string(),
             description: "Check deploy state".to_string(),
+            description_localizations: Default::default(),
             options: Vec::new(),
         }];
         let body = slash_command_registration_body(&specs);
@@ -4515,9 +4649,17 @@ mod tests {
 
         let client = reqwest::Client::new();
         let desired = slash_command_registration_body(&[]);
-        let err = reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri())
-            .await
-            .unwrap_err();
+        let err = reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Global,
+            &[],
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("stale skill command delete"));
     }
 
@@ -4548,9 +4690,184 @@ mod tests {
 
         let client = reqwest::Client::new();
         let desired = slash_command_registration_body(&[]);
-        reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri())
-            .await
-            .unwrap();
+        reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Global,
+            &[],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn guild_scope_registers_to_the_guild_endpoint() {
+        // scope=Guild with one guild routes the upsert to
+        // /applications/{app}/guilds/{gid}/commands; the (empty) global
+        // endpoint is listed for cross-scope cleanup but has nothing to reap.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[]);
+        reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Guild,
+            &["g1".to_string()],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn scope_switch_reaps_owned_commands_from_the_inactive_scope() {
+        // Switching to guild scope reaps our `/ask` + skill commands left on the
+        // now-inactive global endpoint, so the same command isn't registered in
+        // both scopes at once (the guild-scope migration hazard).
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // Derive the stale `/ask` from what we register (incl. its
+        // `description_localizations`, which the reaper's listing requests via
+        // `with_localizations=true`) plus a server-side id - so its projection
+        // matches ours and the ownership check reaps it (#7922).
+        let mut stale_ask = slash_command_registration_body(&[]).as_array().unwrap()[0].clone();
+        stale_ask["id"] = serde_json::json!("a1");
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                stale_ask,
+                stale_skill_command("c1", "ghost-skill")
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/a1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/c1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[]);
+        reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Guild,
+            &["g1".to_string()],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn scope_switch_spares_foreign_ask_in_inactive_scope() {
+        // A `/ask` registered by OTHER tooling (different description) on the
+        // now-inactive global scope must NOT be reaped on a scope switch - we
+        // only delete the `/ask` whose projection matches what we register
+        // (#7922). Our own skill command on that scope is still reaped.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let foreign_ask = serde_json::json!({
+            "id": "x1", "name": "ask",
+            "description": "Ask a DIFFERENT bot", "type": 1,
+            "options": [{ "name": "prompt", "description": "What to ask", "type": 3, "required": true }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                foreign_ask,
+                stale_skill_command("c1", "ghost-skill")
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Our owned skill command IS reaped...
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/c1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // ...but the foreign `/ask` (x1) must NOT be: expect(0) fails on drop if
+        // a delete is ever issued for it.
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/x1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[]);
+        reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Guild,
+            &["g1".to_string()],
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -4561,14 +4878,13 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
-        let existing_ask = serde_json::json!({
-            "id": "a1", "name": "ask",
-            "description": "Ask the agent a question", "type": 1,
-            "options": [{
-                "name": "prompt", "description": "What to ask",
-                "type": 3, "required": true
-            }]
-        });
+        // Echo back exactly what we'd register for `/ask` (incl. its
+        // `description_localizations`, which the GET requests via
+        // `with_localizations=true`) plus a server-side id - so the projection
+        // matches and no upsert fires. Deriving it keeps the test agnostic to
+        // the built-in translation table.
+        let mut existing_ask = slash_command_registration_body(&[]).as_array().unwrap()[0].clone();
+        existing_ask["id"] = serde_json::json!("a1");
         let foreign = serde_json::json!({
             "id": "f1", "name": "run",
             "description": "external tool", "type": 1,
@@ -4591,9 +4907,17 @@ mod tests {
 
         let client = reqwest::Client::new();
         let desired = slash_command_registration_body(&[]);
-        reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri())
-            .await
-            .unwrap();
+        reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Global,
+            &[],
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -4620,9 +4944,17 @@ mod tests {
         let client = reqwest::Client::new();
         let desired = slash_command_registration_body(&[]); // /ask → one POST
         let now = crate::discord_slash_state::now_unix();
-        let outcome = reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri())
-            .await
-            .unwrap();
+        let outcome = reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Global,
+            &[],
+        )
+        .await
+        .unwrap();
         match outcome {
             ReconcileOutcome::RateLimited { until } => assert!(until >= now + 5),
             ReconcileOutcome::Reconciled => panic!("expected RateLimited on a POST 429"),
@@ -7500,6 +7832,116 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn thread_parent_cached_reads_cache_without_rest() {
+        // Cache-only lookup: a thread whose parent was resolved by an earlier
+        // message returns that parent; a channel cached as a non-thread, or one
+        // never looked up, returns None. No client/token is reachable here, so a
+        // non-None result can only have come from the cache (never a REST probe).
+        let cache: Arc<AsyncMutex<HashMap<String, Option<String>>>> =
+            Arc::new(AsyncMutex::new(HashMap::new()));
+        {
+            let mut c = cache.lock().await;
+            c.insert("thread1".to_string(), Some("parentA".to_string()));
+            c.insert("plain1".to_string(), None);
+        }
+        assert_eq!(
+            discord_thread_parent_cached(&cache, "thread1").await,
+            Some("parentA".to_string()),
+            "cached thread resolves to its parent"
+        );
+        assert_eq!(
+            discord_thread_parent_cached(&cache, "plain1").await,
+            None,
+            "channel cached as a non-thread has no parent"
+        );
+        assert_eq!(
+            discord_thread_parent_cached(&cache, "never_seen").await,
+            None,
+            "uncached channel yields None (fail-closed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn autocomplete_authorizes_parent_allowlisted_thread_only_when_cached() {
+        // Regression for #8103: the type-4 arm resolves the thread parent from
+        // the shared cache (no REST) and passes it to `interaction_gate`, so a
+        // thread under an allowlisted parent authorizes autocomplete exactly as
+        // the message path does (#6829) — but only once the parent is cached.
+        // This reproduces the arm's authz step: cache-only parent → gate.
+        let peers = s(&["*"]);
+        let channel_filter = s(&["parentA"]); // allowlist the PARENT only
+        let cache: Arc<AsyncMutex<HashMap<String, Option<String>>>> =
+            Arc::new(AsyncMutex::new(HashMap::new()));
+        cache
+            .lock()
+            .await
+            .insert("thread_cached".to_string(), Some("parentA".to_string()));
+
+        // Thread whose parent is cached + allowlisted → autocomplete authorized.
+        let parent = discord_thread_parent_cached(&cache, "thread_cached").await;
+        assert!(
+            interaction_gate(
+                &peers,
+                &[],
+                &channel_filter,
+                "u1",
+                Some("g1"),
+                "thread_cached",
+                parent.as_deref(),
+            )
+            .is_ok(),
+            "cached allowlisted parent authorizes autocomplete in the thread"
+        );
+
+        // Same allowlist, thread NOT yet cached → no parent → fail-closed,
+        // matching the pre-fix behavior and avoiding a per-keystroke REST probe.
+        let parent = discord_thread_parent_cached(&cache, "thread_uncached").await;
+        assert!(
+            interaction_gate(
+                &peers,
+                &[],
+                &channel_filter,
+                "u1",
+                Some("g1"),
+                "thread_uncached",
+                parent.as_deref(),
+            )
+            .is_err(),
+            "uncached thread stays fail-closed"
+        );
+    }
+
+    #[test]
+    fn autocomplete_arm_resolves_cached_thread_parent_before_gate() {
+        // Source-level regression for #8103: within the type-4 arm, the parent
+        // is resolved from the cache (`discord_thread_parent_cached`) and that
+        // value (`thread_parent.as_deref()`) — not `None` — is passed to
+        // `interaction_gate`, with resolution preceding the gate. Reverting the
+        // arm to pass `None` removes `thread_parent.as_deref()` and fails this.
+        let src = include_str!("mod.rs");
+        let arm4 = src
+            .find("} else if itype == 4 {")
+            .expect("type-4 arm present");
+        let end = src[arm4..]
+            .find("// MESSAGE_UPDATE / MESSAGE_DELETE / MESSAGE_DELETE_BULK")
+            .map(|i| arm4 + i)
+            .expect("type-4 arm end boundary present");
+        let region = &src[arm4..end];
+        let cached = region
+            .find("discord_thread_parent_cached(")
+            .expect("type-4 arm resolves the cached thread parent");
+        let gate = region.find("interaction_gate(").expect("type-4 arm gates");
+        assert!(
+            cached < gate,
+            "cached thread-parent resolution must precede the gate"
+        );
+        assert!(
+            region.contains("thread_parent.as_deref()"),
+            "the resolved cached parent (not None) is passed to interaction_gate"
+        );
+    }
+
     // ── Autocomplete (type-4) choice sourcing ────────────────────────────────
     //
     // The type-4 arm's body is: authorize (pure gate) → extract the focused
@@ -7512,6 +7954,7 @@ mod tests {
         let mut opt = slash_options::OptionSpec {
             name: option.to_string(),
             description: "o".to_string(),
+            description_localizations: Default::default(),
             kind: slash_options::OptKind::String,
             required: false,
             choices: Vec::new(),
@@ -7531,6 +7974,7 @@ mod tests {
             skill_name: "deploy".to_string(),
             slug: slug.to_string(),
             description: "d".to_string(),
+            description_localizations: Default::default(),
             options: vec![opt],
         }
     }

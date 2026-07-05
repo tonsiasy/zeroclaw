@@ -1,5 +1,8 @@
 /target
 /target-*/
+
+# Desktop installer build artifacts
+*.dmg
 /docs/book/book/
 /docs/book/po/messages.pot
 /docs/book/po/*.failures.log
@@ -107,3 +110,4 @@ web/src/lib/api-generated.ts
 target/openapi.json
 /v[0-9]*.toml
 .worktrees/
+.zero-to-5/
