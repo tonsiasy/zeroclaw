@@ -15,6 +15,61 @@ crate::define_provider_ref!(AgentAlias, "agents");
 crate::define_provider_ref!(PeerGroupName, "peer_groups");
 crate::define_provider_ref!(PeerUsername, "channels.peers");
 
+/// One parsed entry of `[agents.<alias>.workspace.read_memory_from]`.
+///
+/// Entries take the form `alias[:cat1,cat2,...]`. `categories == None`
+/// means the bare form: read every category (historical behavior).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryReadScope {
+    /// Target agent alias.
+    pub agent: String,
+    /// Allowed categories (trimmed, lowercased). `None` = all.
+    pub categories: Option<Vec<String>>,
+}
+
+/// Parse a `read_memory_from` entry.
+///
+/// Precedence: a raw string that exactly matches an existing agent
+/// alias (per `alias_exists`) is a bare entry even if it contains `:`;
+/// only otherwise is it split at the FIRST `:`. This keeps entries
+/// unambiguous should an operator configure a colon-bearing alias.
+///
+/// Errors on an empty category token (`"a:"`, `"a:,x"`, `"a:x,"`).
+pub fn parse_read_scope(
+    raw: &str,
+    alias_exists: impl Fn(&str) -> bool,
+) -> Result<MemoryReadScope, String> {
+    if alias_exists(raw) {
+        return Ok(MemoryReadScope {
+            agent: raw.to_string(),
+            categories: None,
+        });
+    }
+    match raw.split_once(':') {
+        None => Ok(MemoryReadScope {
+            agent: raw.to_string(),
+            categories: None,
+        }),
+        Some((agent, cats)) => {
+            let mut categories = Vec::new();
+            for tok in cats.split(',') {
+                let tok = tok.trim();
+                if tok.is_empty() {
+                    return Err(format!(
+                        "empty category token in read_memory_from entry {raw:?}; \
+                         expected the form alias[:cat1,cat2,...]"
+                    ));
+                }
+                categories.push(tok.to_ascii_lowercase());
+            }
+            Ok(MemoryReadScope {
+                agent: agent.to_string(),
+                categories: Some(categories),
+            })
+        }
+    }
+}
+
 /// Cross-agent filesystem grant.
 ///
 /// Used as the value type in `[agents.<alias>.workspace.access]` maps.
@@ -467,5 +522,49 @@ exposed_skills = ["research", "summarize"]
         assert_eq!(parsed.exposed_skills.len(), 2);
         assert_eq!(parsed.exposed_skills[0], "research");
         assert_eq!(parsed.exposed_skills[1], "summarize");
+    }
+
+    #[test]
+    fn parse_read_scope_bare_alias_means_all_categories() {
+        let s = parse_read_scope("steward", |_| false).unwrap();
+        assert_eq!(s.agent, "steward");
+        assert_eq!(s.categories, None);
+    }
+
+    #[test]
+    fn parse_read_scope_single_and_multi_categories() {
+        let s = parse_read_scope("steward:family", |_| false).unwrap();
+        assert_eq!(s.agent, "steward");
+        assert_eq!(s.categories, Some(vec!["family".to_string()]));
+
+        let s = parse_read_scope("steward:family,events", |_| false).unwrap();
+        assert_eq!(
+            s.categories,
+            Some(vec!["family".to_string(), "events".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_read_scope_trims_and_lowercases_tokens() {
+        let s = parse_read_scope("steward: Family , EVENTS ", |_| false).unwrap();
+        assert_eq!(
+            s.categories,
+            Some(vec!["family".to_string(), "events".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_read_scope_rejects_empty_category_token() {
+        assert!(parse_read_scope("steward:", |_| false).is_err());
+        assert!(parse_read_scope("steward:,x", |_| false).is_err());
+        assert!(parse_read_scope("steward:family,", |_| false).is_err());
+    }
+
+    #[test]
+    fn parse_read_scope_exact_alias_precedence_wins_over_split() {
+        // An agent literally named "a:b" is configured: bare semantics win.
+        let s = parse_read_scope("a:b", |alias| alias == "a:b").unwrap();
+        assert_eq!(s.agent, "a:b");
+        assert_eq!(s.categories, None);
     }
 }
