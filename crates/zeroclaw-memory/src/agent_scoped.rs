@@ -17,13 +17,15 @@
 //!   config permits.
 //!
 //! Cross-backend allowlist entries are rejected at config load. The
-//! wrapper only ever sees same-backend sibling UUIDs in its
-//! `allowed_agent_ids` set.
+//! wrapper only ever sees same-backend sibling UUIDs in its `allowed`
+//! map, each mapped to an optional per-sibling category constraint
+//! (`None` = every category) enforced by [`AgentScopedMemory::entry_visible`]
+//! on every read path that can return sibling rows.
 
 use super::traits::{ExportFilter, Memory, MemoryCategory, MemoryEntry, ProceduralMessage};
 use anyhow::Result;
 use async_trait::async_trait;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// A `Memory` impl that scopes every read and write to a bound agent's
@@ -41,11 +43,10 @@ pub struct AgentScopedMemory {
     /// The bound agent's UUID (from `agents.id`). Stamped on every
     /// write through this wrapper.
     agent_id: String,
-    /// Set of agent UUIDs this wrapper recalls from. Always contains
-    /// [`Self::agent_id`] (an agent always sees its own rows); any
-    /// additional UUIDs come from the configured `read_memory_from`
-    /// allowlist resolved at construction.
-    allowed_agent_ids: HashSet<String>,
+    /// agent UUID -> allowed categories (lowercased). `None` = all
+    /// categories. Always contains `agent_id -> None` (an agent sees
+    /// every category of its own rows).
+    allowed: HashMap<String, Option<HashSet<String>>>,
 }
 
 impl AgentScopedMemory {
@@ -55,22 +56,38 @@ impl AgentScopedMemory {
     /// `agents` table by alias at construction time in the runtime
     /// factory). `allowed_sibling_agent_ids` is the resolved
     /// `read_memory_from` allowlist; the bound `agent_id` is added
-    /// automatically to the in-memory `allowed_agent_ids` set so
-    /// callers do not need to remember to include themselves.
+    /// automatically to the in-memory `allowed` map so callers do not
+    /// need to remember to include themselves. Delegates to
+    /// [`Self::with_category_scopes`] with an all-`None` (every
+    /// category) constraint per sibling.
     #[must_use]
     pub fn new(
         inner: Arc<dyn Memory>,
         agent_id: impl Into<String>,
         allowed_sibling_agent_ids: impl IntoIterator<Item = String>,
     ) -> Self {
+        let scopes = allowed_sibling_agent_ids.into_iter().map(|id| (id, None));
+        Self::with_category_scopes(inner, agent_id, scopes)
+    }
+
+    /// Category-aware constructor. Each `(agent_id, constraint)` pair
+    /// grants read access to that sibling: `None` = every category,
+    /// `Some(set)` = only rows whose category (string form,
+    /// case-insensitive) is in the set.
+    #[must_use]
+    pub fn with_category_scopes(
+        inner: Arc<dyn Memory>,
+        agent_id: impl Into<String>,
+        scopes: impl IntoIterator<Item = (String, Option<HashSet<String>>)>,
+    ) -> Self {
         let agent_id = agent_id.into();
-        let mut allowed_agent_ids: HashSet<String> =
-            allowed_sibling_agent_ids.into_iter().collect();
-        allowed_agent_ids.insert(agent_id.clone());
+        let mut allowed: HashMap<String, Option<HashSet<String>>> =
+            scopes.into_iter().collect();
+        allowed.insert(agent_id.clone(), None);
         Self {
             inner,
             agent_id,
-            allowed_agent_ids,
+            allowed,
         }
     }
 
@@ -78,7 +95,23 @@ impl AgentScopedMemory {
     /// `Memory::recall_for_agents` trait method, which takes a
     /// borrowed slice. Stable iteration order is not required.
     fn allowed_slice(&self) -> Vec<&str> {
-        self.allowed_agent_ids.iter().map(String::as_str).collect()
+        self.allowed.keys().map(String::as_str).collect()
+    }
+
+    /// The single confidentiality predicate for sibling rows. Every
+    /// read path that can return sibling rows must gate on this.
+    fn entry_visible(&self, e: &MemoryEntry) -> bool {
+        let Some(aid) = e.agent_id.as_deref() else {
+            return false;
+        };
+        if aid == self.agent_id {
+            return true;
+        }
+        match self.allowed.get(aid) {
+            None => false,
+            Some(None) => true,
+            Some(Some(cats)) => cats.contains(&e.category.to_string().to_ascii_lowercase()),
+        }
     }
 }
 
@@ -213,9 +246,11 @@ impl Memory for AgentScopedMemory {
         until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
         let allowed = self.allowed_slice();
-        self.inner
+        let entries = self
+            .inner
             .recall_for_agents(&allowed, query, limit, session_id, since, until)
-            .await
+            .await?;
+        Ok(entries.into_iter().filter(|e| self.entry_visible(e)).collect())
     }
 
     async fn recall_for_agents(
@@ -236,24 +271,27 @@ impl Memory for AgentScopedMemory {
         // early so the empty-allowlist sentinel ("no filter") on the
         // inner backend does not silently widen scope.
         if caller_allowed.is_empty() {
-            let bound: Vec<&str> = self.allowed_agent_ids.iter().map(String::as_str).collect();
-            return self
+            let bound: Vec<&str> = self.allowed.keys().map(String::as_str).collect();
+            let entries = self
                 .inner
                 .recall_for_agents(&bound, query, limit, session_id, since, until)
-                .await;
+                .await?;
+            return Ok(entries.into_iter().filter(|e| self.entry_visible(e)).collect());
         }
 
         let intersected: Vec<&str> = caller_allowed
             .iter()
             .copied()
-            .filter(|id| self.allowed_agent_ids.contains(*id))
+            .filter(|id| self.allowed.contains_key(*id))
             .collect();
         if intersected.is_empty() {
             return Ok(Vec::new());
         }
-        self.inner
+        let entries = self
+            .inner
             .recall_for_agents(&intersected, query, limit, session_id, since, until)
-            .await
+            .await?;
+        Ok(entries.into_iter().filter(|e| self.entry_visible(e)).collect())
     }
 
     async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
@@ -265,22 +303,30 @@ impl Memory for AgentScopedMemory {
         if let Some(own) = self.inner.get_for_agent(key, &self.agent_id).await? {
             return Ok(Some(own));
         }
-        for sibling in &self.allowed_agent_ids {
+        for sibling in self.allowed.keys() {
             if sibling == &self.agent_id {
                 continue;
             }
             if let Some(hit) = self.inner.get_for_agent(key, sibling).await? {
-                return Ok(Some(hit));
+                if self.entry_visible(&hit) {
+                    return Ok(Some(hit));
+                }
+                // Category-blocked: keep scanning other siblings rather
+                // than returning None early.
             }
         }
         Ok(None)
     }
 
     async fn get_for_agent(&self, key: &str, agent_id: &str) -> Result<Option<MemoryEntry>> {
-        if agent_id != self.agent_id && !self.allowed_agent_ids.iter().any(|a| a == agent_id) {
+        if agent_id != self.agent_id && !self.allowed.contains_key(agent_id) {
             return Ok(None);
         }
-        self.inner.get_for_agent(key, agent_id).await
+        Ok(self
+            .inner
+            .get_for_agent(key, agent_id)
+            .await?
+            .filter(|e| self.entry_visible(e)))
     }
 
     async fn list(
@@ -295,11 +341,7 @@ impl Memory for AgentScopedMemory {
         let entries = self.inner.list(category, session_id).await?;
         Ok(entries
             .into_iter()
-            .filter(|e| {
-                e.agent_id
-                    .as_deref()
-                    .is_some_and(|aid| self.allowed_agent_ids.contains(aid))
-            })
+            .filter(|e| self.entry_visible(e))
             .collect())
     }
 
@@ -386,7 +428,7 @@ impl Memory for AgentScopedMemory {
             .filter(|e| {
                 e.agent_id
                     .as_deref()
-                    .is_some_and(|aid| self.allowed_agent_ids.contains(aid))
+                    .is_some_and(|aid| self.allowed.contains_key(aid))
             })
             .count())
     }
@@ -896,6 +938,218 @@ mod tests {
         assert!(
             !hits.iter().any(|e| e.key == "rogue-key"),
             "caller allowlist must be intersected, not unioned"
+        );
+    }
+
+    use std::collections::HashSet as StdHashSet;
+
+    fn family_only() -> Option<StdHashSet<String>> {
+        let mut s = StdHashSet::new();
+        s.insert("family".to_string());
+        Some(s)
+    }
+
+    /// Store one 'family' and one 'private' row attributed to `uuid`
+    /// through a wrapper bound to that agent.
+    async fn seed_sibling_rows(inner: &Arc<SqliteMemory>, uuid: &str) {
+        let mem = AgentScopedMemory::new(as_dyn(inner.clone()), uuid, Vec::<String>::new());
+        mem.store(
+            "fam-event",
+            "family visits grandma on saturday",
+            MemoryCategory::Custom("family".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "private-note",
+            "salary negotiation strategy",
+            MemoryCategory::Custom("private".into()),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn category_scope_filters_recall() {
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
+        seed_sibling_rows(&inner, &uuids[1]).await;
+
+        let alpha = AgentScopedMemory::with_category_scopes(
+            as_dyn(inner.clone()),
+            &uuids[0],
+            vec![(uuids[1].clone(), family_only())],
+        );
+        let hits = alpha.recall("grandma", 10, None, None, None).await.unwrap();
+        assert!(hits.iter().any(|e| e.key == "fam-event"), "family row visible");
+        let hits = alpha.recall("salary", 10, None, None, None).await.unwrap();
+        assert!(
+            hits.iter().all(|e| e.key != "private-note"),
+            "private row must not recall through a family-only scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn category_scope_filters_get_and_get_for_agent() {
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
+        seed_sibling_rows(&inner, &uuids[1]).await;
+
+        let alpha = AgentScopedMemory::with_category_scopes(
+            as_dyn(inner.clone()),
+            &uuids[0],
+            vec![(uuids[1].clone(), family_only())],
+        );
+        assert!(alpha.get("fam-event").await.unwrap().is_some());
+        assert!(
+            alpha.get("private-note").await.unwrap().is_none(),
+            "get() must not fall back into a category-blocked sibling row"
+        );
+        assert!(
+            alpha
+                .get_for_agent("private-note", &uuids[1])
+                .await
+                .unwrap()
+                .is_none(),
+            "get_for_agent() must apply the category constraint"
+        );
+    }
+
+    #[tokio::test]
+    async fn category_scope_get_fallback_continues_past_blocked_sibling() {
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta", "gamma"]).await;
+        // beta owns key "shared-key" in a BLOCKED category; gamma owns the
+        // same key in an ALLOWED category.
+        let beta = AgentScopedMemory::new(as_dyn(inner.clone()), &uuids[1], Vec::<String>::new());
+        beta.store("shared-key", "beta private", MemoryCategory::Custom("private".into()), None)
+            .await
+            .unwrap();
+        let gamma = AgentScopedMemory::new(as_dyn(inner.clone()), &uuids[2], Vec::<String>::new());
+        gamma
+            .store("shared-key", "gamma family", MemoryCategory::Custom("family".into()), None)
+            .await
+            .unwrap();
+
+        let alpha = AgentScopedMemory::with_category_scopes(
+            as_dyn(inner.clone()),
+            &uuids[0],
+            vec![
+                (uuids[1].clone(), family_only()),
+                (uuids[2].clone(), family_only()),
+            ],
+        );
+        let hit = alpha
+            .get("shared-key")
+            .await
+            .unwrap()
+            .expect("must continue to gamma's allowed row, not stop at beta's blocked row");
+        assert_eq!(hit.content, "gamma family");
+    }
+
+    #[tokio::test]
+    async fn category_scope_filters_list_and_export() {
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
+        seed_sibling_rows(&inner, &uuids[1]).await;
+
+        let alpha = AgentScopedMemory::with_category_scopes(
+            as_dyn(inner.clone()),
+            &uuids[0],
+            vec![(uuids[1].clone(), family_only())],
+        );
+        let listed = alpha.list(None, None).await.unwrap();
+        assert!(listed.iter().any(|e| e.key == "fam-event"));
+        assert!(listed.iter().all(|e| e.key != "private-note"));
+
+        let exported = alpha
+            .export(&ExportFilter {
+                namespace: None,
+                session_id: None,
+                category: None,
+                since: None,
+                until: None,
+            })
+            .await
+            .unwrap();
+        assert!(exported.iter().any(|e| e.key == "fam-event"));
+        assert!(
+            exported.iter().all(|e| e.key != "private-note"),
+            "export (GDPR path) must honor the category constraint"
+        );
+    }
+
+    #[tokio::test]
+    async fn category_scope_survives_caller_allowlist_intersection() {
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
+        seed_sibling_rows(&inner, &uuids[1]).await;
+
+        let alpha = AgentScopedMemory::with_category_scopes(
+            as_dyn(inner.clone()),
+            &uuids[0],
+            vec![(uuids[1].clone(), family_only())],
+        );
+        let caller = vec![uuids[1].as_str()];
+        let hits = alpha
+            .recall_for_agents(&caller, "salary", 10, None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            hits.iter().all(|e| e.key != "private-note"),
+            "caller-supplied allowlist must not bypass category constraints"
+        );
+    }
+
+    #[tokio::test]
+    async fn category_scope_own_rows_and_bare_siblings_unaffected() {
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
+        seed_sibling_rows(&inner, &uuids[1]).await;
+
+        // Alpha stores its own private row.
+        let alpha_seed = AgentScopedMemory::new(as_dyn(inner.clone()), &uuids[0], Vec::<String>::new());
+        alpha_seed
+            .store("own-secret", "alpha own private", MemoryCategory::Custom("private".into()), None)
+            .await
+            .unwrap();
+
+        // Constrained sibling, but own rows must remain fully visible.
+        let alpha = AgentScopedMemory::with_category_scopes(
+            as_dyn(inner.clone()),
+            &uuids[0],
+            vec![(uuids[1].clone(), family_only())],
+        );
+        assert!(alpha.get("own-secret").await.unwrap().is_some());
+
+        // A bare (None) sibling constraint behaves exactly like today.
+        let alpha_bare = AgentScopedMemory::with_category_scopes(
+            as_dyn(inner.clone()),
+            &uuids[0],
+            vec![(uuids[1].clone(), None)],
+        );
+        assert!(alpha_bare.get("private-note").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn category_match_is_case_insensitive() {
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
+        let beta = AgentScopedMemory::new(as_dyn(inner.clone()), &uuids[1], Vec::<String>::new());
+        beta.store("fam-mixed", "row stored with mixed-case category", MemoryCategory::Custom("Family".into()), None)
+            .await
+            .unwrap();
+
+        let alpha = AgentScopedMemory::with_category_scopes(
+            as_dyn(inner.clone()),
+            &uuids[0],
+            vec![(uuids[1].clone(), family_only())], // constraint is lowercase "family"
+        );
+        assert!(
+            alpha.get("fam-mixed").await.unwrap().is_some(),
+            "entry category 'Family' must match constraint 'family'"
         );
     }
 }
