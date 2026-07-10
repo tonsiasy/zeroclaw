@@ -2437,6 +2437,58 @@ mod tests {
         assert!(find_all_references(&cfg, &AliasKind::Agent, "bot").is_empty());
     }
 
+    #[test]
+    fn find_agent_refs_reports_category_scoped_read_memory_from() {
+        // collect_agent_refs must report a category-scoped entry
+        // ("alpha:family") as referencing the parsed agent part, with
+        // raw_value carrying the stored text — mirroring validate(),
+        // which routes these entries through parse_read_scope.
+        let mut cfg = empty_config();
+        cfg.agents
+            .insert("alpha".to_string(), AliasedAgentConfig::default());
+        let mut lead = AliasedAgentConfig::default();
+        lead.workspace
+            .read_memory_from
+            .push(AgentAlias::new("alpha:family"));
+        cfg.agents.insert("lead".to_string(), lead);
+
+        let sites = find_all_references(&cfg, &AliasKind::Agent, "alpha");
+        let site = sites
+            .iter()
+            .find(|s| s.path == "agents.lead.workspace.read_memory_from[0]")
+            .expect("scoped entry reported as a ref site");
+        assert_eq!(site.strength, RefStrength::Soft);
+        assert_eq!(site.raw_value, "alpha:family");
+    }
+
+    #[test]
+    fn cascade_agent_scrubs_category_scoped_read_memory_from() {
+        // Deleting an agent must drop category-scoped entries
+        // ("alpha:family") too, not just bare-alias entries — otherwise
+        // a dangling scoped ref survives the delete and fails
+        // validate() on the next config load.
+        let mut cfg = empty_config();
+        cfg.agents
+            .insert("alpha".to_string(), AliasedAgentConfig::default());
+        let mut lead = AliasedAgentConfig::default();
+        lead.workspace
+            .read_memory_from
+            .push(AgentAlias::new("alpha:family"));
+        cfg.agents.insert("lead".to_string(), lead);
+
+        let report = delete_with_cascade(
+            &mut cfg,
+            &AliasKind::Agent,
+            "alpha",
+            CascadePolicy::RefuseOnHard,
+        )
+        .expect("delete succeeds with a category-scoped referrer");
+        assert_eq!(report.deleted_entry.as_deref(), Some("agents.alpha"));
+        assert!(!cfg.agents.contains_key("alpha"));
+        assert!(cfg.agents["lead"].workspace.read_memory_from.is_empty());
+        assert!(find_all_references(&cfg, &AliasKind::Agent, "alpha").is_empty());
+    }
+
     // ── delete_with_cascade (channels) ──────────────────────────────────────
 
     fn channel_kind() -> AliasKind {
@@ -2731,6 +2783,44 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted, report.dirty_paths);
+    }
+
+    #[test]
+    fn rename_agent_preserves_read_memory_from_category_suffix() {
+        // A category-scoped entry ("alpha:family") must have only its
+        // agent part rewritten on rename; the category suffix survives
+        // verbatim. Bare entries keep the bare form.
+        let mut cfg = empty_config();
+        cfg.agents
+            .insert("alpha".to_string(), AliasedAgentConfig::default());
+        let mut lead = AliasedAgentConfig::default();
+        lead.workspace
+            .read_memory_from
+            .push(AgentAlias::new("alpha:family"));
+        lead.workspace
+            .read_memory_from
+            .push(AgentAlias::new("alpha:family,events"));
+        cfg.agents.insert("lead".to_string(), lead);
+
+        let report = rename_with_cascade(&mut cfg, &AliasKind::Agent, "alpha", "omega")
+            .expect("agent rename succeeds");
+        assert_eq!(report.new_alias, "omega");
+        assert!(!cfg.agents.contains_key("alpha"));
+        assert!(cfg.agents.contains_key("omega"));
+        assert_eq!(
+            cfg.agents["lead"].workspace.read_memory_from,
+            vec![
+                AgentAlias::new("omega:family"),
+                AgentAlias::new("omega:family,events"),
+            ]
+        );
+        // post-condition: nothing references the old alias anymore
+        assert!(find_all_references(&cfg, &AliasKind::Agent, "alpha").is_empty());
+        assert!(
+            report.dirty_paths.iter().any(|p| p == "agents.lead"),
+            "referrer marked dirty: {:?}",
+            report.dirty_paths
+        );
     }
 
     #[test]
