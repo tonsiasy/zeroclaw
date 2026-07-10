@@ -19311,7 +19311,20 @@ impl Config {
             // the per-agent memory plumbing consumes the allowlist.
             let agent_backend = agent.memory.backend;
             for (i, target) in agent.workspace.read_memory_from.iter().enumerate() {
-                let target_str = target.as_str();
+                let raw = target.as_str();
+                let scope = match crate::multi_agent::parse_read_scope(raw, |a| {
+                    self.agents.contains_key(a)
+                }) {
+                    Ok(scope) => scope,
+                    Err(reason) => {
+                        validation_bail!(
+                            InvalidFormat,
+                            format!("agents.{alias}.workspace.read_memory_from[{i}]"),
+                            "agents.{alias}.workspace.read_memory_from[{i}] = {raw:?}: {reason}",
+                        );
+                    }
+                };
+                let target_str = scope.agent.as_str();
                 if target_str == alias.as_str() {
                     validation_bail!(
                         InvalidFormat,
@@ -19332,6 +19345,18 @@ impl Config {
                         InvalidFormat,
                         format!("agents.{alias}.workspace.read_memory_from[{i}]"),
                         "agents.{alias}.workspace.read_memory_from[{i}] points at agents.{target_str} which uses memory backend {target_backend:?}, but agents.{alias} uses {agent_backend:?}; the allowlist must point at same-backend siblings only",
+                    );
+                }
+                if scope.categories.is_some()
+                    && matches!(
+                        agent_backend,
+                        crate::multi_agent::MemoryBackendKind::Markdown
+                    )
+                {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.workspace.read_memory_from[{i}]"),
+                        "agents.{alias}.workspace.read_memory_from[{i}] = {raw:?} is category-scoped, but agents.{alias} uses the markdown memory backend which cannot filter rows by category; category-scoped read_memory_from requires a SQL/vector backend",
                     );
                 }
             }
@@ -31455,6 +31480,97 @@ allowed_users = []
         assert!(
             msg.contains("same-backend siblings only"),
             "expected cross-backend explanation, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_category_scoped_read_memory_from_on_sql_backend() {
+        let mut config = multi_agent_test_config();
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha
+            .workspace
+            .read_memory_from
+            .push(crate::multi_agent::AgentAlias::new("beta:family,events"));
+        config
+            .validate()
+            .expect("category-scoped entry on sqlite must validate");
+    }
+
+    #[test]
+    async fn validate_rejects_empty_category_token() {
+        let mut config = multi_agent_test_config();
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha
+            .workspace
+            .read_memory_from
+            .push(crate::multi_agent::AgentAlias::new("beta:"));
+        let err = config
+            .validate()
+            .expect_err("empty category token must fail validation");
+        assert!(
+            err.to_string().contains("empty category token"),
+            "expected empty-token explanation, got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_category_scope_with_dangling_alias() {
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha
+            .workspace
+            .read_memory_from
+            .push(crate::multi_agent::AgentAlias::new("ghost:family"));
+        let err = config
+            .validate()
+            .expect_err("dangling alias must fail even with category suffix");
+        assert!(
+            err.to_string().contains("agents.ghost is not configured"),
+            "the parsed agent part must drive the dangling-ref check, got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_category_scope_on_markdown_backend() {
+        let mut config = multi_agent_test_config();
+        // Both agents on Markdown so the same-backend check passes and the
+        // markdown-specific rejection is what fires.
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".into(),
+            memory: crate::multi_agent::AgentMemoryConfig {
+                backend: crate::multi_agent::MemoryBackendKind::Markdown,
+            },
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha.memory.backend = crate::multi_agent::MemoryBackendKind::Markdown;
+        alpha
+            .workspace
+            .read_memory_from
+            .push(crate::multi_agent::AgentAlias::new("beta:family"));
+        let err = config
+            .validate()
+            .expect_err("markdown + category scope must fail validation");
+        assert!(
+            err.to_string().contains("markdown"),
+            "expected markdown-backend explanation, got: {err}"
         );
     }
 
