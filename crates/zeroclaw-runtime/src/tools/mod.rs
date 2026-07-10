@@ -2042,6 +2042,74 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn create_memory_for_agent_applies_category_scoped_read_memory_from() {
+        use zeroclaw_api::memory_traits::MemoryCategory;
+
+        let tmp = TempDir::new().unwrap();
+        let mut agents = HashMap::new();
+        agents.insert("steward".to_string(), AliasedAgentConfig::default());
+        let mut tutor = AliasedAgentConfig::default();
+        tutor
+            .workspace
+            .read_memory_from
+            .push(zeroclaw_config::multi_agent::AgentAlias::new("steward:family"));
+        agents.insert("tutor".to_string(), tutor);
+
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            agents,
+            ..Config::default()
+        };
+
+        // Steward writes one shared and one private row.
+        let steward_mem = zeroclaw_memory::create_memory_for_agent(&config, "steward", None)
+            .await
+            .expect("steward memory builds");
+        steward_mem
+            .store(
+                "fam-event",
+                "family visits grandma on saturday",
+                MemoryCategory::Custom("family".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        steward_mem
+            .store(
+                "private-note",
+                "salary negotiation strategy",
+                MemoryCategory::Custom("private".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        // Sanity: steward sees its own row (guards against a no-op inner
+        // backend making the assertions below pass vacuously).
+        assert!(
+            steward_mem.get("private-note").await.unwrap().is_some(),
+            "fixture must produce a persisting backend; if this fails, mirror \
+             the storage setup of the nearest passing create_memory_for_agent test"
+        );
+
+        // Tutor reads steward restricted to 'family'.
+        let tutor_mem = zeroclaw_memory::create_memory_for_agent(&config, "tutor", None)
+            .await
+            .expect("tutor memory builds");
+        let listed = tutor_mem.list(None, None).await.unwrap();
+        assert!(
+            listed.iter().any(|e| e.key == "fam-event"),
+            "family-category sibling row must be visible"
+        );
+        assert!(
+            listed.iter().all(|e| e.key != "private-note"),
+            "private-category sibling row must be hidden"
+        );
+        assert!(tutor_mem.get("fam-event").await.unwrap().is_some());
+        assert!(tutor_mem.get("private-note").await.unwrap().is_none());
+    }
+
     /// A runtime that reports an ephemeral workspace (no host persistence) while
     /// delegating real shell execution to `NativeRuntime`. Used to exercise the
     /// registration wiring of `has_filesystem_access()` -> `persistent_writes`.

@@ -160,11 +160,22 @@ impl SubAgentSpawn {
             .get(agent_alias)
             .with_context(|| format!("no agent configured under alias {agent_alias:?}"))?;
 
+        // Normalize entries to the agent part so override subset checks
+        // compare aliases, not raw scoped strings. Category narrowing is
+        // intentionally dropped here: this set gates *alias reachability*
+        // only; actual memory scoping always flows through
+        // `create_memory_for_agent`.
         let mut parent_allowed_agent_aliases: HashSet<String> = agent
             .workspace
             .read_memory_from
             .iter()
-            .map(|alias| alias.as_str().to_string())
+            .map(|entry| {
+                zeroclaw_config::multi_agent::parse_read_scope(entry.as_str(), |a| {
+                    config.agents.contains_key(a)
+                })
+                .map(|scope| scope.agent)
+                .unwrap_or_else(|_| entry.as_str().to_string())
+            })
             .collect();
         parent_allowed_agent_aliases.insert(agent_alias.to_string());
 

@@ -735,10 +735,14 @@ pub async fn create_memory_for_agent(
         let own = MarkdownMemory::new("markdown", &own_workspace);
         let mut peers: Vec<agent_scoped_markdown::MarkdownPeer> = Vec::new();
         for peer in &agent_cfg.workspace.read_memory_from {
-            let peer_alias = peer.as_str();
-            let peer_workspace = config.agent_workspace_dir(peer_alias);
+            let peer_alias = zeroclaw_config::multi_agent::parse_read_scope(peer.as_str(), |a| {
+                config.agents.contains_key(a)
+            })
+            .map(|scope| scope.agent)
+            .unwrap_or_else(|_| peer.as_str().to_string());
+            let peer_workspace = config.agent_workspace_dir(&peer_alias);
             peers.push(agent_scoped_markdown::MarkdownPeer {
-                alias: peer_alias.to_string(),
+                alias: peer_alias,
                 memory: MarkdownMemory::new("markdown", &peer_workspace),
             });
         }
@@ -775,13 +779,25 @@ pub async fn create_memory_for_agent(
     // layer). The factory is therefore backend-agnostic past the
     // Markdown branch above.
     let bound_id = inner_arc.ensure_agent_uuid(agent_alias).await?;
-    let mut allowlist_ids = Vec::with_capacity(agent_cfg.workspace.read_memory_from.len());
+    let mut scopes = Vec::with_capacity(agent_cfg.workspace.read_memory_from.len());
     for peer in &agent_cfg.workspace.read_memory_from {
-        let uuid = inner_arc.ensure_agent_uuid(peer.as_str()).await?;
-        allowlist_ids.push(uuid);
+        let scope = zeroclaw_config::multi_agent::parse_read_scope(peer.as_str(), |a| {
+            config.agents.contains_key(a)
+        })
+        .map_err(|reason| {
+            anyhow::anyhow!(
+                "invalid read_memory_from entry {:?} on agents.{agent_alias}: {reason}",
+                peer.as_str()
+            )
+        })?;
+        let uuid = inner_arc.ensure_agent_uuid(&scope.agent).await?;
+        let categories = scope
+            .categories
+            .map(|cats| cats.into_iter().collect::<std::collections::HashSet<_>>());
+        scopes.push((uuid, categories));
     }
 
-    let scoped = AgentScopedMemory::new(inner_arc, bound_id, allowlist_ids);
+    let scoped = AgentScopedMemory::with_category_scopes(inner_arc, bound_id, scopes);
     Ok(Arc::new(scoped))
 }
 
