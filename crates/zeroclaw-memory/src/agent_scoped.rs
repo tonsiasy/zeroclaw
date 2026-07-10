@@ -81,8 +81,7 @@ impl AgentScopedMemory {
         scopes: impl IntoIterator<Item = (String, Option<HashSet<String>>)>,
     ) -> Self {
         let agent_id = agent_id.into();
-        let mut allowed: HashMap<String, Option<HashSet<String>>> =
-            scopes.into_iter().collect();
+        let mut allowed: HashMap<String, Option<HashSet<String>>> = scopes.into_iter().collect();
         allowed.insert(agent_id.clone(), None);
         Self {
             inner,
@@ -250,7 +249,10 @@ impl Memory for AgentScopedMemory {
             .inner
             .recall_for_agents(&allowed, query, limit, session_id, since, until)
             .await?;
-        Ok(entries.into_iter().filter(|e| self.entry_visible(e)).collect())
+        Ok(entries
+            .into_iter()
+            .filter(|e| self.entry_visible(e))
+            .collect())
     }
 
     async fn recall_for_agents(
@@ -276,7 +278,10 @@ impl Memory for AgentScopedMemory {
                 .inner
                 .recall_for_agents(&bound, query, limit, session_id, since, until)
                 .await?;
-            return Ok(entries.into_iter().filter(|e| self.entry_visible(e)).collect());
+            return Ok(entries
+                .into_iter()
+                .filter(|e| self.entry_visible(e))
+                .collect());
         }
 
         let intersected: Vec<&str> = caller_allowed
@@ -291,7 +296,10 @@ impl Memory for AgentScopedMemory {
             .inner
             .recall_for_agents(&intersected, query, limit, session_id, since, until)
             .await?;
-        Ok(entries.into_iter().filter(|e| self.entry_visible(e)).collect())
+        Ok(entries
+            .into_iter()
+            .filter(|e| self.entry_visible(e))
+            .collect())
     }
 
     async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
@@ -307,13 +315,13 @@ impl Memory for AgentScopedMemory {
             if sibling == &self.agent_id {
                 continue;
             }
-            if let Some(hit) = self.inner.get_for_agent(key, sibling).await? {
-                if self.entry_visible(&hit) {
-                    return Ok(Some(hit));
-                }
-                // Category-blocked: keep scanning other siblings rather
-                // than returning None early.
+            if let Some(hit) = self.inner.get_for_agent(key, sibling).await?
+                && self.entry_visible(&hit)
+            {
+                return Ok(Some(hit));
             }
+            // Category-blocked (or no row on this sibling): keep scanning
+            // other siblings rather than returning None early.
         }
         Ok(None)
     }
@@ -983,7 +991,10 @@ mod tests {
             vec![(uuids[1].clone(), family_only())],
         );
         let hits = alpha.recall("grandma", 10, None, None, None).await.unwrap();
-        assert!(hits.iter().any(|e| e.key == "fam-event"), "family row visible");
+        assert!(
+            hits.iter().any(|e| e.key == "fam-event"),
+            "family row visible"
+        );
         let hits = alpha.recall("salary", 10, None, None, None).await.unwrap();
         assert!(
             hits.iter().all(|e| e.key != "private-note"),
@@ -1024,12 +1035,22 @@ mod tests {
         // beta owns key "shared-key" in a BLOCKED category; gamma owns the
         // same key in an ALLOWED category.
         let beta = AgentScopedMemory::new(as_dyn(inner.clone()), &uuids[1], Vec::<String>::new());
-        beta.store("shared-key", "beta private", MemoryCategory::Custom("private".into()), None)
-            .await
-            .unwrap();
+        beta.store(
+            "shared-key",
+            "beta private",
+            MemoryCategory::Custom("private".into()),
+            None,
+        )
+        .await
+        .unwrap();
         let gamma = AgentScopedMemory::new(as_dyn(inner.clone()), &uuids[2], Vec::<String>::new());
         gamma
-            .store("shared-key", "gamma family", MemoryCategory::Custom("family".into()), None)
+            .store(
+                "shared-key",
+                "gamma family",
+                MemoryCategory::Custom("family".into()),
+                None,
+            )
             .await
             .unwrap();
 
@@ -1110,9 +1131,15 @@ mod tests {
         seed_sibling_rows(&inner, &uuids[1]).await;
 
         // Alpha stores its own private row.
-        let alpha_seed = AgentScopedMemory::new(as_dyn(inner.clone()), &uuids[0], Vec::<String>::new());
+        let alpha_seed =
+            AgentScopedMemory::new(as_dyn(inner.clone()), &uuids[0], Vec::<String>::new());
         alpha_seed
-            .store("own-secret", "alpha own private", MemoryCategory::Custom("private".into()), None)
+            .store(
+                "own-secret",
+                "alpha own private",
+                MemoryCategory::Custom("private".into()),
+                None,
+            )
             .await
             .unwrap();
 
@@ -1138,9 +1165,14 @@ mod tests {
         let (_tmp, inner) = fresh_sqlite();
         let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
         let beta = AgentScopedMemory::new(as_dyn(inner.clone()), &uuids[1], Vec::<String>::new());
-        beta.store("fam-mixed", "row stored with mixed-case category", MemoryCategory::Custom("Family".into()), None)
-            .await
-            .unwrap();
+        beta.store(
+            "fam-mixed",
+            "row stored with mixed-case category",
+            MemoryCategory::Custom("Family".into()),
+            None,
+        )
+        .await
+        .unwrap();
 
         let alpha = AgentScopedMemory::with_category_scopes(
             as_dyn(inner.clone()),

@@ -785,10 +785,21 @@ pub async fn create_memory_for_agent(
             config.agents.contains_key(a)
         })
         .map_err(|reason| {
-            anyhow::anyhow!(
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "agent": agent_alias,
+                        "entry": peer.as_str(),
+                        "reason": reason,
+                    })),
+                "invalid read_memory_from entry"
+            );
+            anyhow::Error::msg(format!(
                 "invalid read_memory_from entry {:?} on agents.{agent_alias}: {reason}",
                 peer.as_str()
-            )
+            ))
         })?;
         let uuid = inner_arc.ensure_agent_uuid(&scope.agent).await?;
         let categories = scope

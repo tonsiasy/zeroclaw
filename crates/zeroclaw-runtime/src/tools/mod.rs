@@ -2053,7 +2053,9 @@ mod tests {
         tutor
             .workspace
             .read_memory_from
-            .push(zeroclaw_config::multi_agent::AgentAlias::new("steward:family"));
+            .push(zeroclaw_config::multi_agent::AgentAlias::new(
+                "steward:family",
+            ));
         agents.insert("tutor".to_string(), tutor);
 
         let config = Config {

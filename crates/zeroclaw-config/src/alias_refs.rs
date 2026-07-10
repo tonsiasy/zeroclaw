@@ -514,13 +514,26 @@ fn scrub_agent_refs(cfg: &mut Config, alias: &str) {
     if clear_acp {
         cfg.acp.default_agent = None;
     }
+    // Snapshot the alias set before the `values_mut()` loop below borrows
+    // `cfg.agents` mutably — `parse_read_scope`'s `alias_exists` probe needs
+    // read access to the same map, and the key set is stable across this
+    // function (only field values are scrubbed here, not agent keys).
+    let known_aliases: std::collections::HashSet<String> = cfg.agents.keys().cloned().collect();
     for agent in cfg.agents.values_mut() {
         agent.delegates.retain(|d| d.agent().trim() != alias); // trimmed (validate trims)
         agent.workspace.access.retain(|k, _| k.as_str() != alias); // raw
-        agent
-            .workspace
-            .read_memory_from
-            .retain(|m| m.as_str() != alias); // raw
+        // workspace.read_memory_from[]: entries may be category-scoped
+        // (`alias:cat1,cat2`), so compare against the parsed agent part
+        // rather than the raw string — otherwise deleting an agent leaves
+        // dangling scoped entries behind (fails validate() on next load).
+        agent.workspace.read_memory_from.retain(|m| {
+            let raw = m.as_str();
+            let entry_agent =
+                crate::multi_agent::parse_read_scope(raw, |a| known_aliases.contains(a))
+                    .map(|scope| scope.agent)
+                    .unwrap_or_else(|_| raw.to_string());
+            entry_agent != alias
+        });
     }
     for group in cfg.peer_groups.values_mut() {
         group.agents.retain(|m| m.as_str() != alias); // raw
@@ -871,6 +884,9 @@ fn rewrite_agent_refs(cfg: &mut Config, old: &str, new: &str) -> Vec<String> {
         cfg.acp.default_agent = Some(new.to_string());
         dirty.push("acp.default_agent".to_string());
     }
+    // Snapshot the alias set before the `iter_mut()` loop below borrows
+    // `cfg.agents` mutably (see `scrub_agent_refs` for why).
+    let known_aliases: std::collections::HashSet<String> = cfg.agents.keys().cloned().collect();
     for (name, agent) in cfg.agents.iter_mut() {
         let mut touched = false;
         for d in agent.delegates.iter_mut() {
@@ -884,10 +900,19 @@ fn rewrite_agent_refs(cfg: &mut Config, old: &str, new: &str) -> Vec<String> {
             agent.workspace.access.insert(AgentAlias::new(new), mode);
             touched = true;
         }
-        // workspace.read_memory_from[] (raw match).
+        // workspace.read_memory_from[]: entries may be category-scoped
+        // (`alias:cat1,cat2`); route through `parse_read_scope` and rewrite
+        // only the agent part so the category suffix survives the rename.
         for m in agent.workspace.read_memory_from.iter_mut() {
-            if m.as_str() == old {
-                *m = AgentAlias::new(new);
+            let raw = m.as_str();
+            let scope = crate::multi_agent::parse_read_scope(raw, |a| known_aliases.contains(a));
+            let entry_agent = scope.as_ref().map(|s| s.agent.as_str()).unwrap_or(raw);
+            if entry_agent == old {
+                let rebuilt = match scope.ok().and_then(|s| s.categories) {
+                    Some(cats) => format!("{new}:{}", cats.join(",")),
+                    None => new.to_string(),
+                };
+                *m = AgentAlias::new(rebuilt);
                 touched = true;
             }
         }
@@ -1436,8 +1461,11 @@ fn collect_agent_refs(cfg: &Config, alias: &str, sites: &mut Vec<RefSite>) {
         }
         // RAW-MATCHED AgentAlias refs below: validate() compares these via
         // `as_str()` WITHOUT trimming (workspace.access schema.rs:17358,
-        // read_memory_from :17382, peer_groups.agents :17453), so we must NOT
-        // trim here either — trimming would itself drift from validate().
+        // peer_groups.agents :17453), so we must NOT trim here either —
+        // trimming would itself drift from validate(). read_memory_from is
+        // the exception: entries may be category-scoped (`alias:cat1,cat2`),
+        // and validate() (schema.rs, `parse_read_scope` call) compares the
+        // parsed agent part, not the raw string — mirror that here.
         //
         // workspace.access map key.
         if agent.workspace.access.keys().any(|k| k.as_str() == alias) {
@@ -1451,11 +1479,16 @@ fn collect_agent_refs(cfg: &Config, alias: &str, sites: &mut Vec<RefSite>) {
         }
         // workspace.read_memory_from[].
         for (i, m) in agent.workspace.read_memory_from.iter().enumerate() {
-            if m.as_str() == alias {
+            let raw = m.as_str();
+            let entry_agent =
+                crate::multi_agent::parse_read_scope(raw, |a| cfg.agents.contains_key(a))
+                    .map(|scope| scope.agent)
+                    .unwrap_or_else(|_| raw.to_string());
+            if entry_agent == alias {
                 sites.push(RefSite::soft(
                     format!("agents.{name}.workspace.read_memory_from[{i}]"),
                     ScrubAction::DropFromVec { index: i },
-                    alias,
+                    raw,
                 ));
             }
         }
