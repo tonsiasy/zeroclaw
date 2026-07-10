@@ -901,16 +901,28 @@ fn rewrite_agent_refs(cfg: &mut Config, old: &str, new: &str) -> Vec<String> {
             touched = true;
         }
         // workspace.read_memory_from[]: entries may be category-scoped
-        // (`alias:cat1,cat2`); route through `parse_read_scope` and rewrite
-        // only the agent part so the category suffix survives the rename.
+        // (`alias:cat1,cat2`); route through `parse_read_scope` to decide
+        // WHETHER the entry references `old`, but reconstruct by slicing
+        // the raw text at the first `:` — parse_read_scope trims and
+        // lowercases category tokens, and the operator's config text must
+        // survive the rename verbatim (only the alias part changes).
         for m in agent.workspace.read_memory_from.iter_mut() {
             let raw = m.as_str();
             let scope = crate::multi_agent::parse_read_scope(raw, |a| known_aliases.contains(a));
-            let entry_agent = scope.as_ref().map(|s| s.agent.as_str()).unwrap_or(raw);
+            let (entry_agent, has_categories) = match &scope {
+                Ok(s) => (s.agent.as_str(), s.categories.is_some()),
+                Err(_) => (raw, false),
+            };
             if entry_agent == old {
-                let rebuilt = match scope.ok().and_then(|s| s.categories) {
-                    Some(cats) => format!("{new}:{}", cats.join(",")),
-                    None => new.to_string(),
+                let rebuilt = if has_categories {
+                    // parse split at the first `:`, so slice the raw
+                    // suffix at the same point (present by construction).
+                    let suffix = raw.split_once(':').map(|(_, c)| c).unwrap_or_default();
+                    format!("{new}:{suffix}")
+                } else {
+                    // Bare entry (including a colon-bearing alias matched
+                    // via exact-alias precedence): whole text is the alias.
+                    new.to_string()
                 };
                 *m = AgentAlias::new(rebuilt);
                 touched = true;
@@ -2821,6 +2833,30 @@ mod tests {
             "referrer marked dirty: {:?}",
             report.dirty_paths
         );
+    }
+
+    #[test]
+    fn rename_agent_keeps_category_suffix_text_verbatim() {
+        // parse_read_scope trims + lowercases category tokens for
+        // MATCHING; the rename must not leak that normalization into the
+        // stored config text. "alpha:Family, Events" → "omega:Family, Events"
+        // — case and whitespace right of the first colon preserved exactly.
+        let mut cfg = empty_config();
+        cfg.agents
+            .insert("alpha".to_string(), AliasedAgentConfig::default());
+        let mut lead = AliasedAgentConfig::default();
+        lead.workspace
+            .read_memory_from
+            .push(AgentAlias::new("alpha:Family, Events"));
+        cfg.agents.insert("lead".to_string(), lead);
+
+        rename_with_cascade(&mut cfg, &AliasKind::Agent, "alpha", "omega")
+            .expect("agent rename succeeds");
+        assert_eq!(
+            cfg.agents["lead"].workspace.read_memory_from,
+            vec![AgentAlias::new("omega:Family, Events")]
+        );
+        assert!(find_all_references(&cfg, &AliasKind::Agent, "alpha").is_empty());
     }
 
     #[test]
