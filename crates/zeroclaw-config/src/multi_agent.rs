@@ -34,6 +34,10 @@ pub struct MemoryReadScope {
 /// only otherwise is it split at the FIRST `:`. This keeps entries
 /// unambiguous should an operator configure a colon-bearing alias.
 ///
+/// Category tokens are lowercased via `to_ascii_lowercase` — the
+/// case-insensitive match is ASCII-only, on both the store side (here)
+/// and the compare side (`AgentScopedMemory::entry_visible`).
+///
 /// Errors on an empty category token (`"a:"`, `"a:,x"`, `"a:x,"`).
 pub fn parse_read_scope(
     raw: &str,

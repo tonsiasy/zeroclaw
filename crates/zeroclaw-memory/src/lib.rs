@@ -735,11 +735,27 @@ pub async fn create_memory_for_agent(
         let own = MarkdownMemory::new("markdown", &own_workspace);
         let mut peers: Vec<agent_scoped_markdown::MarkdownPeer> = Vec::new();
         for peer in &agent_cfg.workspace.read_memory_from {
-            let peer_alias = zeroclaw_config::multi_agent::parse_read_scope(peer.as_str(), |a| {
-                config.agents.contains_key(a)
-            })
-            .map(|scope| scope.agent)
-            .unwrap_or_else(|_| peer.as_str().to_string());
+            let peer_alias = match zeroclaw_config::multi_agent::parse_read_scope(
+                peer.as_str(),
+                |a| config.agents.contains_key(a),
+            ) {
+                // Parsed successfully and category-scoped: the markdown
+                // backend has no per-row category to filter on (it reads
+                // the peer's whole MEMORY.md), so silently keeping
+                // `scope.agent` here would grant full wholesale read
+                // where the operator asked for a category-limited one.
+                // Fail closed rather than degrade the grant (spec §7).
+                Ok(scope) if scope.categories.is_some() => {
+                    anyhow::bail!(
+                        "read_memory_from entry {:?} on agents.{agent_alias} is category-scoped, but the markdown backend cannot filter by category; remove the ':<categories>' suffix or switch backends",
+                        peer.as_str()
+                    );
+                }
+                Ok(scope) => scope.agent,
+                // A parse error means "not recognized as scoped syntax";
+                // fall back to the raw string as before.
+                Err(_) => peer.as_str().to_string(),
+            };
             let peer_workspace = config.agent_workspace_dir(&peer_alias);
             peers.push(agent_scoped_markdown::MarkdownPeer {
                 alias: peer_alias,

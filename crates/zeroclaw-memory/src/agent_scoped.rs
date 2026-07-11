@@ -81,7 +81,19 @@ impl AgentScopedMemory {
         scopes: impl IntoIterator<Item = (String, Option<HashSet<String>>)>,
     ) -> Self {
         let agent_id = agent_id.into();
-        let mut allowed: HashMap<String, Option<HashSet<String>>> = scopes.into_iter().collect();
+        let mut allowed: HashMap<String, Option<HashSet<String>>> = scopes
+            .into_iter()
+            .map(|(id, cats)| {
+                (
+                    id,
+                    cats.map(|set| {
+                        set.into_iter()
+                            .map(|c| c.to_ascii_lowercase())
+                            .collect::<HashSet<String>>()
+                    }),
+                )
+            })
+            .collect();
         allowed.insert(agent_id.clone(), None);
         Self {
             inner,
@@ -429,15 +441,15 @@ impl Memory for AgentScopedMemory {
 
     async fn count(&self) -> Result<usize> {
         // Scope to the bound + allowlisted agents so a wrapper-using
-        // caller does not see the install-wide row total.
+        // caller does not see the install-wide row total. Gate on the
+        // same `entry_visible` predicate `list()` uses so a
+        // category-constrained sibling's blocked rows are not counted
+        // either (otherwise `count()` would leak the existence of
+        // category-blocked rows and disagree with `list().len()`).
         let entries = self.inner.list(None, None).await?;
         Ok(entries
             .into_iter()
-            .filter(|e| {
-                e.agent_id
-                    .as_deref()
-                    .is_some_and(|aid| self.allowed.contains_key(aid))
-            })
+            .filter(|e| self.entry_visible(e))
             .count())
     }
 
@@ -1182,6 +1194,41 @@ mod tests {
         assert!(
             alpha.get("fam-mixed").await.unwrap().is_some(),
             "entry category 'Family' must match constraint 'family'"
+        );
+    }
+
+    /// `count()` must gate on the same `entry_visible` predicate `list()`
+    /// uses, not merely on sibling membership. Regression: a prior
+    /// implementation counted every row attributed to an allowlisted
+    /// sibling regardless of category, over-counting relative to
+    /// `list()` and leaking the existence of category-blocked rows.
+    #[tokio::test]
+    async fn count_gates_on_entry_visible_like_list() {
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
+        seed_sibling_rows(&inner, &uuids[1]).await;
+
+        let alpha = AgentScopedMemory::with_category_scopes(
+            as_dyn(inner.clone()),
+            &uuids[0],
+            vec![(uuids[1].clone(), family_only())],
+        );
+        alpha
+            .store("own-note", "alpha's own row", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let listed = alpha.list(None, None).await.unwrap();
+        let counted = alpha.count().await.unwrap();
+        assert_eq!(
+            counted,
+            listed.len(),
+            "count() must agree with list(None, None): both gate on entry_visible"
+        );
+        assert_eq!(
+            counted, 2,
+            "expected alpha's own row + the visible 'family' sibling row only \
+             (the 'private' sibling row must not be counted)"
         );
     }
 }

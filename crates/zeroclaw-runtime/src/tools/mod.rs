@@ -2112,6 +2112,84 @@ mod tests {
         assert!(tutor_mem.get("private-note").await.unwrap().is_none());
     }
 
+    /// The markdown backend composes per-agent `MEMORY.md` peers and has no
+    /// per-row category to filter on. A category-scoped `read_memory_from`
+    /// entry (`"steward:family"`) must therefore fail closed rather than
+    /// silently degrade to a full wholesale read of the peer's file (spec
+    /// §7) — even though `Config::validate()` also rejects this shape, a
+    /// hand-edited config can still reach this factory (validate() failures
+    /// are demoted to a startup WARN by `Config::load_or_init`).
+    #[tokio::test]
+    async fn create_memory_for_agent_markdown_backend_rejects_category_scoped_entry() {
+        use zeroclaw_config::multi_agent::MemoryBackendKind;
+
+        let tmp = TempDir::new().unwrap();
+        let mut agents = HashMap::new();
+        agents.insert("steward".to_string(), AliasedAgentConfig::default());
+        let mut tutor = AliasedAgentConfig::default();
+        tutor.memory.backend = MemoryBackendKind::Markdown;
+        tutor
+            .workspace
+            .read_memory_from
+            .push(zeroclaw_config::multi_agent::AgentAlias::new(
+                "steward:family",
+            ));
+        agents.insert("tutor".to_string(), tutor);
+
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            agents,
+            ..Config::default()
+        };
+
+        let result = zeroclaw_memory::create_memory_for_agent(&config, "tutor", None).await;
+        let err = match result {
+            Ok(_) => panic!(
+                "markdown backend must fail closed on a category-scoped read_memory_from entry"
+            ),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("category-scoped"),
+            "error must explain the markdown backend cannot filter by category, got: {err}"
+        );
+    }
+
+    /// Companion to the rejection test above: a bare (non-category-scoped)
+    /// `read_memory_from` entry must still build successfully on the
+    /// markdown backend — the fail-closed check must not reject every
+    /// entry, only category-scoped ones.
+    #[tokio::test]
+    async fn create_memory_for_agent_markdown_backend_allows_bare_entry() {
+        use zeroclaw_config::multi_agent::MemoryBackendKind;
+
+        let tmp = TempDir::new().unwrap();
+        let mut agents = HashMap::new();
+        agents.insert("steward".to_string(), AliasedAgentConfig::default());
+        let mut tutor = AliasedAgentConfig::default();
+        tutor.memory.backend = MemoryBackendKind::Markdown;
+        tutor
+            .workspace
+            .read_memory_from
+            .push(zeroclaw_config::multi_agent::AgentAlias::new("steward"));
+        agents.insert("tutor".to_string(), tutor);
+
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            agents,
+            ..Config::default()
+        };
+
+        let result = zeroclaw_memory::create_memory_for_agent(&config, "tutor", None).await;
+        assert!(
+            result.is_ok(),
+            "bare read_memory_from entry must still build on the markdown backend: {:?}",
+            result.err()
+        );
+    }
+
     /// A runtime that reports an ephemeral workspace (no host persistence) while
     /// delegating real shell execution to `NativeRuntime`. Used to exercise the
     /// registration wiring of `has_filesystem_access()` -> `persistent_writes`.

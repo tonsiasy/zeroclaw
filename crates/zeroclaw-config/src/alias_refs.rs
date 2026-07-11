@@ -493,8 +493,12 @@ fn delete_agent(
 /// Mutating mirror of [`collect_agent_refs`]: clear soft scalar refs and drop
 /// soft collection elements naming `alias`. Trims the same sites
 /// `collect_agent_refs` trims (heartbeat, acp.default_agent, delegates) and
-/// leaves the three `AgentAlias`-keyed sites raw (workspace.access,
-/// read_memory_from, peer_groups.agents) — both mirror `validate()` exactly.
+/// leaves workspace.access / peer_groups.agents raw — both mirror
+/// `validate()` exactly. `read_memory_from` is the exception: entries may be
+/// category-scoped (`alias:cat1,cat2`), so this parses each entry via
+/// `parse_read_scope` and compares the parsed agent part, not the raw
+/// string — matching `validate()`'s own comparison (see the fuller note in
+/// [`collect_agent_refs`]).
 /// `heartbeat.agent` is cleared only when reached (an *enabled* heartbeat
 /// pointing at `alias` is a HARD ref, refused before this runs). `retain` is
 /// index-shift-safe. The loop over `cfg.agents.values_mut()` still includes the
