@@ -1,0 +1,156 @@
+# =====================================================================
+# ZeroClaw 家庭 agent 完整配置示例 —— 方案 C：单入口 + 矩阵子 agent
+# 基于 category 级 read_memory_from（分支 feat/category-scoped-read-memory-from）
+#
+# 拓扑：
+#   全家所有成员 ──▶ 一个微信号 ──▶ steward（前置：身份识别 + 领域路由 + 家庭档案）
+#                                     │ delegate 按 (发送者 × 问题域) 派发
+#                    ┌────────────────┼────────────────┐
+#              health-elder      health-dad        tutor-kid     ← 领域×成员矩阵
+#              （老人健康）      （你的健康）       （孩子辅导）    ← 零微信账户成本
+#
+# 隔离保证（代码级验证过）：
+#   · 子 agent 经 read_memory_from=["steward:family"] 只读家庭共享事实
+#   · 老人健康数据结构性地只存在 health-elder 的记忆里——跨成员污染机制上不可能
+#   · 子 agent 互相不可见（非传递）；对话历史按发送者自动隔离
+#   · delegate-only 子 agent 无需绑定渠道（schema.rs:19096 "Empty list is
+#     valid (delegate-only agent)"），扩展成员/领域只加配置块，不加账户
+# =====================================================================
+
+# ---------- 模型提供方（按你的实际情况改） ----------
+[providers.models.anthropic.default]
+api_key = "sk-ant-..."
+model   = "claude-sonnet-5"
+
+# ---------- 记忆后端 ----------
+# category 级共享要求 SQL/向量后端（markdown 会在校验期被拒绝，且工厂层有运行时兜底）
+[memory]
+backend = "sqlite"
+
+# ---------- runtime profile：委派链路能挂上工具的关键 ----------
+# 每个 agent 的 runtime_profile 指向这里。agentic=true 是硬要求——
+# delegate 是否走 agentic（进而给子 agent 挂 memory_recall 等工具）只看
+# 【目标 agent 的 runtime_profile.agentic】，delegate 调用里的 agentic=true 参数被忽略。
+# 子 agent 若不设 runtime_profile → resolve_agentic 返回 false → 委派非 agentic →
+# 子 agent 零工具，会报"memory_recall 未挂载/unknown tool"（数据其实都在，是工具没挂）。
+[runtime_profiles.default]
+agentic = true
+
+# ---------- 微信渠道：全家共用一个账户 ----------
+[channels.wechat.family]
+enabled   = true
+state_dir = "~/.zeroclaw/wechat/family"
+
+# ---------- steward：前置管家（唯一入口 + 家庭档案所有者） ----------
+[agents.steward]
+enabled        = true
+channels       = ["wechat.family"]   # 唯一绑定渠道的 agent；渠道必须被恰好一个 agent 认领
+model_provider = "anthropic.default"
+risk_profile   = "default"
+runtime_profile = "default"        # ★ 必须：委派子 agent 靠此进入 agentic 模式挂上工具（含 memory_recall）；缺失=非agentic=零工具
+# 领域×成员矩阵路由表：steward 只能派发到这里列出的目标
+delegates      = ["health-elder", "health-dad", "tutor-kid"]
+
+[agents.steward.memory]
+backend = "sqlite"                   # 所有 agent 必须同后端（read_memory_from 硬约束）
+
+[agents.steward.workspace]
+# ⚠️ 方案 C 关键决策：steward 不读任何子 agent 的记忆。
+# 原因：steward 面向全家所有成员对话，而语义召回不按发送者分区——
+# 如果 steward 能读 health-elder，老人的病历可能被召回进和孩子的对话里。
+# 家长监督改为按需 delegate（见文件末尾 IDENTITY.md 约定第 4 条）。
+read_memory_from = []
+
+# ---------- health-elder：老人健康助手（delegate-only，无渠道） ----------
+[agents.health-elder]
+enabled        = true
+channels       = []                  # 不绑渠道：只通过 steward 派发到达
+model_provider = "anthropic.default"
+risk_profile   = "default"
+runtime_profile = "default"        # ★ 必须：委派子 agent 靠此进入 agentic 模式挂上工具（含 memory_recall）；缺失=非agentic=零工具
+
+[agents.health-elder.memory]
+backend = "sqlite"
+
+[agents.health-elder.workspace]
+read_memory_from = ["steward:family"]   # ★ 只读家庭共享类；老人健康数据留在本 agent
+
+# ---------- health-dad：你的健康助手 ----------
+[agents.health-dad]
+enabled        = true
+channels       = []
+model_provider = "anthropic.default"
+risk_profile   = "default"
+runtime_profile = "default"        # ★ 必须：委派子 agent 靠此进入 agentic 模式挂上工具（含 memory_recall）；缺失=非agentic=零工具
+
+[agents.health-dad.memory]
+backend = "sqlite"
+
+[agents.health-dad.workspace]
+read_memory_from = ["steward:family"]
+
+# ---------- tutor-kid：孩子的辅导老师 ----------
+[agents.tutor-kid]
+enabled        = true
+channels       = []
+model_provider = "anthropic.default"
+risk_profile   = "default"
+runtime_profile = "default"        # ★ 必须：委派子 agent 靠此进入 agentic 模式挂上工具（含 memory_recall）；缺失=非agentic=零工具
+
+[agents.tutor-kid.memory]
+backend = "sqlite"
+
+[agents.tutor-kid.workspace]
+read_memory_from = ["steward:family"]
+
+# ---------- 按需扩展：新成员/新领域 = 复制一个子 agent 块 ----------
+# [agents.tutor-elder]      # 老人想学用智能手机？
+# [agents.health-kid]       # 孩子的疫苗/生长记录？
+# 记得同步加进 steward 的 delegates 列表。
+
+# ---------- peer 白名单与成员配对（已核实的机制，务必按序操作） ----------
+# 授权机制两层分离：白名单管"能不能对话"（渠道层拦截，未授权消息进不了
+# agent）；身份识别管"你是谁"（steward 按 IDENTITY.md 注册表映射 sender ID）。
+#
+# 三人家庭上线序列（⚠️ 配对码单次消费 + 守卫只在白名单为空时创建，顺序错了要重来）：
+#   ① 启动 daemon → 控制台打印 QR + 配对码
+#   ② 管理员扫码 → bot 登录 + 扫码者自动成为 peer #1
+#   ③ 同一次运行内，让第二位成员发 /bind <配对码> → peer #2（配对码即销毁）
+#   ④ 第三位成员先随便发一条消息 → debug 日志出现
+#      "ignoring unauthorized message from" + from_user_id
+#      → 把该 wxid 填进下面 external_peers → peer #3
+#   ⑤ 三个 wxid 登记进 steward 的 IDENTITY.md 成员注册表（见文末第 1 条）
+#
+# [peer_groups.family]
+# channel        = "wechat.family"
+# agents         = ["steward"]
+# external_peers = ["<你的wxid>", "<孩子的wxid>", "<老人的wxid>"]
+# 注意：external_peers 支持 "*" 通配（任何人可对话）——家庭场景强烈不建议。
+
+# =====================================================================
+# 配置之外必须做的事（人格与路由约定在 workspace 文件，不在 TOML）：
+#
+# steward 的 IDENTITY.md（agents/steward/workspace/IDENTITY.md）必须写清四件事：
+#
+# 1) 成员注册表：微信 sender ID → 成员身份/称呼
+#    「wxid_xxx = 爸爸（管理员）；wxid_yyy = 孩子（10岁）；wxid_zzz = 奶奶」
+#
+# 2) 记忆分类约定：
+#    「家庭共享信息（成员档案、日程、家务、全家事件）用 memory_store
+#      category="family" 存储；主人私密管理信息用 category="private"。」
+#    （category 匹配 ASCII 大小写不敏感；未知类别匹配为空，fail closed）
+#
+# 3) 路由规则：
+#    「健康类问题：奶奶发来 → delegate("health-elder")；爸爸发来 →
+#      delegate("health-dad")。学习辅导：孩子发来 → delegate("tutor-kid")。
+#      派发时在任务里注明是谁在问 + 相关家庭背景。家务/日程/闲聊自己处理。」
+#
+# 4) 家长监督门控（替代 read_memory_from 全局视野）：
+#    「仅当消息来自爸爸(wxid_xxx)时，才允许发起『汇报奶奶健康状况/孩子
+#      学习进度』类的 delegate 查询；其他成员提出此类请求一律拒绝。」
+#    ⚠️ 这是提示词级防线（非结构性）——是方案 C 中家长监督的已知代价。
+#
+# 各子 agent 的 IDENTITY.md 写各自领域人格与护栏：
+#    health-*：非诊断、用药谨慎、异常催促就医；面向老人用大字化繁为简
+#    tutor-kid：鼓励式、分学段、儿童安全护栏
+# =====================================================================
