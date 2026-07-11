@@ -8,7 +8,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::{Mutex, RwLock};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -277,9 +277,16 @@ impl SqliteMemory {
             CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
             CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(key);
 
-            -- FTS5 full-text search (BM25 scoring)
+            -- FTS5 full-text search (BM25 scoring).
+            -- `trigram` tokenizer indexes 3-character sequences so substring
+            -- matches work for scripts without whitespace word boundaries
+            -- (CJK): the default `unicode61` tokenizer indexes an unbroken run
+            -- of Han characters as a single token, making mid-run terms
+            -- unsearchable. Existing databases are upgraded by
+            -- `migrate_fts_to_trigram` below.
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-                key, content, content=memories, content_rowid=rowid
+                key, content, content=memories, content_rowid=rowid,
+                tokenize='trigram'
             );
 
             -- FTS5 triggers: keep in sync with memories table
@@ -358,6 +365,34 @@ impl SqliteMemory {
             "CREATE INDEX IF NOT EXISTS idx_memories_namespace_category ON memories(namespace, category);",
         )
         .with_context(|| "SQLite init_schema failed: CREATE INDEX idx_memories_namespace_category")?;
+
+        // Upgrade a pre-existing `memories_fts` to the `trigram` tokenizer.
+        // The `CREATE VIRTUAL TABLE IF NOT EXISTS` above only sets the
+        // tokenizer for freshly created databases; a database that already
+        // carried a `unicode61` index keeps it. Detect that via the stored
+        // table definition and rebuild in place so CJK substring queries
+        // match. Idempotent once the definition mentions `trigram`; triggers
+        // reference the table by name and survive the drop/recreate, and the
+        // external-content `rebuild` repopulates the index from `memories`.
+        let existing_fts_sql: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='memories_fts'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if existing_fts_sql.is_some_and(|sql| !sql.contains("trigram")) {
+            execute_batch_retry(
+                conn,
+                "DROP TABLE IF EXISTS memories_fts;
+                 CREATE VIRTUAL TABLE memories_fts USING fts5(
+                     key, content, content=memories, content_rowid=rowid,
+                     tokenize='trigram'
+                 );
+                 INSERT INTO memories_fts(memories_fts) VALUES('rebuild');",
+            )
+            .with_context(|| "SQLite init_schema failed: rebuild memories_fts as trigram")?;
+        }
 
         Self::migrate_session_ids_to_sanitized(conn)?;
 
@@ -1098,8 +1133,15 @@ impl Memory for SqliteMemory {
                 }
             }
 
-            // If hybrid returned nothing, fall back to LIKE search.
-            if results.is_empty() {
+            // Supplement with a LIKE substring scan when the keyword/vector
+            // pass under-filled the result set. Gating on `< limit` (rather
+            // than "empty") is deliberate: a weak partial FTS hit must not
+            // suppress substring matches the tokenizer missed. Existing
+            // FTS/vector results keep their rank; LIKE rows are appended and
+            // de-duplicated by id.
+            if results.len() < limit {
+                let existing_ids: std::collections::HashSet<String> =
+                    results.iter().map(|entry| entry.id.clone()).collect();
                 const MAX_LIKE_KEYWORDS: usize = 8;
                 let raw_keywords: Vec<String> = query
                     .split_whitespace()
@@ -1185,6 +1227,9 @@ impl Memory for SqliteMemory {
                     })?;
                     for row in rows {
                         let entry = row?;
+                        if existing_ids.contains(&entry.id) {
+                            continue;
+                        }
                         if let Some(sid) = session_ref
                             && entry.session_id.as_deref() != Some(sid) {
                                 continue;
@@ -2484,6 +2529,45 @@ mod tests {
         assert!(!results.is_empty());
         // "The quick dog runs fast" matches both terms
         assert!(results[0].content.contains("quick"));
+    }
+
+    #[tokio::test]
+    async fn recall_chinese_name_query_retrieves_all_matching_rows() {
+        // Regression: the default `unicode61` FTS5 tokenizer treats an unbroken
+        // run of Han characters as a single token, so a query like "刘银环" only
+        // matched rows where the name happened to sit on a punctuation boundary
+        // (a standalone token). That partial hit left the result set non-empty,
+        // which suppressed the LIKE fallback, so rows where the same name was
+        // embedded mid-run were never retrieved — the exact failure that made a
+        // health assistant report "no records" while the data was present.
+        let (_tmp, mem) = temp_sqlite();
+        // Name on a fullwidth-paren boundary → standalone token under unicode61.
+        mem.store(
+            "diag",
+            "刘银环（奶奶）确诊干燥综合征",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        // Name embedded in a longer Han run → NOT a standalone token under unicode61.
+        mem.store(
+            "med",
+            "刘银环目前处方磷酸氯喹片每日一次",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let results = mem.recall("刘银环", 10, None, None, None).await.unwrap();
+        let keys: std::collections::HashSet<&str> =
+            results.iter().map(|e| e.key.as_str()).collect();
+        assert!(keys.contains("diag"), "expected diag row, got {keys:?}");
+        assert!(
+            keys.contains("med"),
+            "medication row must be retrievable for a Chinese name query, got {keys:?}"
+        );
     }
 
     #[tokio::test]

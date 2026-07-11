@@ -3301,7 +3301,8 @@ pub fn migrate_sqlite_memory_to_v3(db_path: &Path, conn: &Connection) -> MigResu
              CREATE INDEX IF NOT EXISTS idx_memories_agent_id  ON memories(agent_id);
 
              CREATE VIRTUAL TABLE memories_fts USING fts5(
-                key, content, content=memories, content_rowid=rowid
+                key, content, content=memories, content_rowid=rowid,
+                tokenize='trigram'
              );
              INSERT INTO memories_fts(memories_fts) VALUES('rebuild');
 
