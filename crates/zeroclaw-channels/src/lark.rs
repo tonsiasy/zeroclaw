@@ -1815,8 +1815,10 @@ impl LarkChannel {
                 return None;
             }
 
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            return Some(format!("[IMAGE:data:{mime};base64,{encoded}]"));
+            // Save inbound image to the channel workspace and reference it by
+            // path (vision loads it on demand) so multi-MB base64 never bloats
+            // session history. Falls back to inline base64 if the save fails.
+            return Some(self.image_marker(image_key, &mime, &bytes).await);
         }
     }
 
@@ -1933,8 +1935,8 @@ impl LarkChannel {
             && let Some(mime) = lark_detect_image_mime(Some(&content_type), &bytes)
             && LARK_SUPPORTED_IMAGE_MIMES.contains(&mime.as_str())
         {
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            return Some(format!("[IMAGE:data:{mime};base64,{encoded}]"));
+            // Same as inbound image messages: save to workspace, reference by path.
+            return Some(self.image_marker(file_key, &mime, &bytes).await);
         }
 
         // If the file looks like text, inline it
@@ -2021,6 +2023,21 @@ impl LarkChannel {
             return None;
         }
         Some(local_path)
+    }
+
+    /// Build the history marker for an inbound image. Prefer saving the bytes
+    /// into the channel workspace and returning a routable `[IMAGE:<path>]`
+    /// marker (vision reads the file on demand) so multi-MB base64 never bloats
+    /// the session history. Falls back to an inline `[IMAGE:data:…]` marker when
+    /// the channel has no workspace or the write fails, so no image is lost.
+    async fn image_marker(&self, key_hint: &str, mime: &str, bytes: &[u8]) -> String {
+        let ext = lark_image_ext_for_mime(mime);
+        let file_name = format!("lark_image_{key_hint}.{ext}");
+        if let Some(path) = self.save_attachment_to_workspace(&file_name, bytes).await {
+            return format!("[IMAGE:{}]", path.display());
+        }
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        format!("[IMAGE:data:{mime};base64,{encoded}]")
     }
 
     async fn fetch_bot_open_id_with_token(
@@ -3954,6 +3971,17 @@ fn lark_detect_image_mime(content_type: Option<&str>, bytes: &[u8]) -> Option<St
         .and_then(|ct| ct.split(';').next())
         .map(|ct| ct.trim().to_lowercase())
         .filter(|ct| ct.starts_with("image/"))
+}
+
+/// Map a supported image MIME to a file extension for saved inbound images.
+fn lark_image_ext_for_mime(mime: &str) -> &'static str {
+    match mime {
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        _ => "png",
+    }
 }
 
 /// Check if a filename looks like a text file based on extension.
@@ -7063,5 +7091,51 @@ mod tests {
 
         drop(post_glance_mock);
         drop(delete_glance_mock);
+    }
+
+    #[tokio::test]
+    async fn lark_inbound_image_saved_to_workspace_returns_path_marker() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let ch = make_channel().with_workspace_dir(workspace.path().to_path_buf());
+        let png = b"\x89PNG\r\n\x1a\nhello-bytes";
+        let marker = ch.image_marker("img_v3_abc", "image/png", png).await;
+
+        // Routable path marker, not multi-MB inline base64.
+        assert!(marker.starts_with("[IMAGE:"), "marker: {marker}");
+        assert!(!marker.contains("data:"), "should not inline base64: {marker}");
+        assert!(marker.contains("lark_files"), "marker: {marker}");
+        assert!(
+            marker.ends_with("lark_image_img_v3_abc.png]"),
+            "marker: {marker}"
+        );
+
+        // File actually landed on disk with the original bytes.
+        let saved = workspace
+            .path()
+            .join("lark_files")
+            .join("lark_image_img_v3_abc.png");
+        assert!(saved.exists(), "image file should exist at {saved:?}");
+        assert_eq!(std::fs::read(&saved).expect("read saved"), png);
+    }
+
+    #[tokio::test]
+    async fn lark_inbound_image_without_workspace_falls_back_to_base64() {
+        let ch = make_channel(); // workspace_dir = None
+        let png = b"\x89PNG\r\n\x1a\n";
+        let marker = ch.image_marker("k", "image/png", png).await;
+        assert!(
+            marker.starts_with("[IMAGE:data:image/png;base64,"),
+            "should fall back to inline base64: {marker}"
+        );
+    }
+
+    #[test]
+    fn lark_image_ext_for_mime_maps_supported_types() {
+        assert_eq!(lark_image_ext_for_mime("image/png"), "png");
+        assert_eq!(lark_image_ext_for_mime("image/jpeg"), "jpg");
+        assert_eq!(lark_image_ext_for_mime("image/gif"), "gif");
+        assert_eq!(lark_image_ext_for_mime("image/webp"), "webp");
+        assert_eq!(lark_image_ext_for_mime("image/bmp"), "bmp");
+        assert_eq!(lark_image_ext_for_mime("image/unknown"), "png");
     }
 }
