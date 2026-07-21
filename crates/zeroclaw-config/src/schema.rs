@@ -21846,7 +21846,9 @@ pub struct SopApprovalConfig {
     /// the transport-derived (channel-authenticated) `ApprovalPrincipal` identity.
     /// A member may be source-qualified (`<source>:<identity>`, e.g. `http:ZeroClawOperator`,
     /// `ws:<subject>`, `agent:<alias>`) to grant rights on one transport only, or a
-    /// bare identity (`ZeroClawOperator`) to grant from any source. A future auth system adds a
+    /// bare identity (`alice`) to grant from any non-channel source. Channel members
+    /// must include the channel namespace (`channel:<channel-key>:<sender>`) so sender
+    /// ids from different channel aliases cannot collide. A future auth system adds a
     /// second resolver alongside this one; it does not replace channel identities.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     #[nested]
@@ -21881,7 +21883,7 @@ pub struct ApprovalPolicyConfig {
     #[serde(default)]
     pub quorum: u32,
     /// Channel to deliver the INITIAL approval request to when a run parks at a
-    /// gate this policy governs, formatted `channel[:recipient]` (e.g.
+    /// gate this policy governs, formatted `channel:recipient` (e.g.
     /// `discord.ops:123456789012345678`). The `channel` names a configured channel
     /// (the `<channel>.<alias>` / bare-`<channel>` key from the channel map); the
     /// `recipient` is that channel's addressee (a Discord channel id, a chat id,
