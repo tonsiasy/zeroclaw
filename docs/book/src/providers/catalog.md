@@ -76,8 +76,11 @@ The `/models` endpoint is public (`PUBLIC_MODEL_LISTING`), so model listing work
 Every canonical slot, its default endpoint, whether it runs locally, and its
 full config field set, generated from the provider registry and the config
 schema. Click a slot to expand its fields; click a field to see how to set it.
-Slots with no fixed default need `uri` set on the alias entry (Azure, `custom`,
-multi-region families, CLI shims).
+Fixed entries show canonical defaults. `operator required` means the alias needs
+endpoint input, such as an Azure resource and deployment or a `custom` `uri`.
+`dynamic / resolved at runtime` endpoints may depend on credentials, region,
+discovery, or runtime state and do not necessarily require `uri`. CLI-backed
+providers use their local command.
 
 {{#model-provider-fields}}
 
@@ -119,6 +122,17 @@ Hugging Face repo IDs (e.g. `meta-llama/Meta-Llama-3.1-8B-Instruct`). Key from
 the newer `mercury-2`). Key from the
 [Inception platform](https://platform.inceptionlabs.ai).
 
+**Atlas Cloud**: slot `atlascloud`. OpenAI-compatible endpoint
+`https://api.atlascloud.ai/v1` with bearer-token auth. Use the canonical
+`atlascloud` slot only; `atlas`, `atlas-cloud`, and `atlas_cloud` are not
+runtime aliases.
+
+```toml
+[providers.models.atlascloud.home]
+model = "..."
+api_key = "..."
+```
+
 > Credentials come only from config (`api_key`) or the `--credential` override at run
 > time, these slots do **not** read a per-provider `*_API_KEY` environment variable.
 
@@ -159,6 +173,8 @@ model    = "MiniMax-M3"                       # or MiniMax-M2.7, MiniMax-M2.7-hi
 api_key  = "..."
 endpoint = "intl"                            # variants: cn, intl
 ```
+
+For MiniMax's Anthropic-compatible API, use `[providers.models.anthropic.minimax]` with `uri = "https://api.minimax.io/anthropic"` (Global) or `uri = "https://api.minimaxi.com/anthropic"` (China) instead.
 
 ### Z.AI: slot `zai`
 
